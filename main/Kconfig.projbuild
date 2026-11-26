@@ -1,0 +1,253 @@
+menu "Amyai 配置"
+
+    config AMYAI_WIFI_SSID
+        string "Wi-Fi 名称 (SSID)"
+        default ""
+        help
+            要连接的 Wi-Fi 名称，区分大小写。
+
+    config AMYAI_WIFI_PASSWORD
+        string "Wi-Fi 密码"
+        default ""
+        help
+            要连接的 Wi-Fi 密码；开放网络请留空。
+
+    config AMYAI_LLM_API_KEY
+        string "大模型 API Key"
+        default ""
+        help
+            智谱 GLM 的 API Key（形如 xxxxx.yyyyy）。
+            注意：量产版本不要把 Key 烧进固件，应走自有中转服务。
+
+endmenu
+
+menu "Amyai 音频硬件"
+
+    config AMYAI_I2C_SDA
+        int "ES8311 I2C SDA 引脚"
+        default 48
+
+    config AMYAI_I2C_SCL
+        int "ES8311 I2C SCL 引脚"
+        default 45
+
+    config AMYAI_I2S_MCLK
+        int "I2S MCLK 引脚（-1 = 不使用）"
+        default -1
+
+    config AMYAI_I2S_BCLK
+        int "I2S BCLK 引脚（-1 = 未配置）"
+        default -1
+
+    config AMYAI_I2S_WS
+        int "I2S WS/LRCK 引脚（-1 = 未配置）"
+        default -1
+
+    config AMYAI_I2S_DIN
+        int "I2S DIN 引脚（codec 数据进 ESP32，-1 = 未配置）"
+        default -1
+
+    config AMYAI_I2S_DOUT
+        int "I2S DOUT 引脚（ESP32 数据进 codec，-1 = 未配置）"
+        default -1
+
+    config AMYAI_PA_PIN
+        int "功放使能引脚（-1 = 没有）"
+        default -1
+
+endmenu
+
+menu "Amyai 唤醒词"
+
+    config AMYAI_WAKE_MODEL
+        string "WakeNet 模型名"
+        default "wn9_xiaoluxiaolu_tts2"
+        help
+            esp-sr 的 WakeNet 模型名。可选值见 esp-sr/wakeword_list.md。
+            例如：
+              wn9_xiaoluxiaolu_tts2   -> 小鹿小鹿
+              wn9_xiaolongxiaolong_tts -> 小龙小龙
+              wn9_nihaoxiaozhi_tts     -> 你好小智
+            注意：换成自制模型时，除了这里，还要在 menuconfig 的
+            ESP Speech Recognition 里勾选对应的模型，才能打包进 model 分区。
+
+    config AMYAI_WAKE_TEXT
+        string "唤醒词文字（仅用于日志显示）"
+        default "小鹿小鹿"
+
+endmenu
+
+menu "Amyai 配网（BLE）"
+
+    config AMYAI_PROV_ENABLE
+        bool "启用 BLE 配网"
+        default y
+        help
+            开启后，设备在没有保存 Wi-Fi 凭据时会自动进入蓝牙配网模式，
+            手机用 ESP BLE Provisioning App 下发 SSID 和密码。
+
+    config AMYAI_PROV_POP
+        string "配网密码 (PoP)"
+        default "abcd1234"
+        help
+            Proof of Possession，手机 App 配网时需要输入。
+            量产时建议改成每台设备唯一的随机值（例如印在机身标签上）。
+
+    config AMYAI_PROV_NAME_PREFIX
+        string "蓝牙设备名前缀"
+        default "AMYAI"
+        help
+            实际广播的名字是「前缀_MAC后6位」，例如 AMYAI_A1B2C3，方便区分多台设备。
+
+    config AMYAI_PROV_TIMEOUT_SEC
+        int "配网等待超时（秒）"
+        default 300
+        range 30 3600
+        help
+            超过这个时间还没配好，就关掉蓝牙，避免一直占着内存和功耗。
+
+    config AMYAI_PROV_RESET_GPIO
+        int "恢复出厂按键 GPIO（-1 = 禁用）"
+        default 0
+        help
+            开机时按住这个引脚（低电平，开发板 BOOT 键即 GPIO0）达到设定时长，
+            会清除已保存的 Wi-Fi 凭据并重新进入配网。
+
+    config AMYAI_PROV_RESET_HOLD_MS
+        int "恢复出厂按住时长（毫秒）"
+        default 3000
+        range 500 20000
+
+endmenu
+
+menu "Amyai 主控通信（UART）"
+
+    config AMYAI_UART_ENABLE
+        bool "启用 UART 指令发送"
+        default y
+        help
+            开启后，大模型解析出的指令会按双芯片协议打包，通过 UART 发给主控板。
+            接法：本板 TX -> 主控 RX，本板 RX <- 主控 TX，并且必须共地。
+
+    config AMYAI_UART_ON_CONSOLE
+        bool "协议走调试串口（免接线，仅验证用）"
+        default n
+        help
+            开启后协议帧直接走调试串口 UART0，和日志共用一个口，
+            不需要额外接线就能把「指令下发 + ACK」整条链路验证一遍。
+            注意：日志和二进制帧会混在一起，只能用于调试；
+            正式产品必须关掉它，用独立的 UART1 和主控通信。
+
+    config AMYAI_UART_PIN_SCAN
+        bool "扫描模式：逐个引脚试 TX，找出接线实际在哪"
+        default n
+        help
+            开启后不按配置的引脚工作，而是每隔 2 秒把 UART1 的 TX 换到
+            IO5 / IO6 / IO8 / IO18（这块板子上仅有的 4 个空闲 IO），
+            并在 payload 里带上引脚号。
+            接线那头用什么工具看，哪个口冒出数据，就说明接的是那个引脚。
+            找到后关掉本项、把 AMYAI_UART_TX_GPIO 设成对应值即可。
+
+    config AMYAI_UART_TX_GPIO
+        int "UART TX 引脚（接主控 RX）"
+        default 17
+    config AMYAI_UART_RX_GPIO
+        int "UART RX 引脚（接主控 TX）"
+        default 18
+
+    config AMYAI_UART_BAUD
+        int "波特率"
+        default 115200
+
+    config AMYAI_UART_ACK_TIMEOUT_MS
+        int "等待 ACK 超时（毫秒）"
+        default 300
+        range 50 2000
+
+    config AMYAI_UART_RETRIES
+        int "重传次数"
+        default 3
+        range 1 10
+
+    config AMYAI_UART_HEARTBEAT
+        bool "发送心跳帧"
+        default y
+        help
+            每秒发一次 type=0x03 心跳，主控 3 秒收不到会停机（安全兜底）。
+
+    config AMYAI_UART_HEARTBEAT_MS
+        int "心跳间隔（毫秒）"
+        default 1000
+        range 200 5000
+
+endmenu
+
+menu "Amyai 语音合成（TTS）"
+
+    config AMYAI_TTS_API_KEY
+        string "百炼 API Key（sk- 开头）"
+        default ""
+        help
+            阿里云百炼（DashScope）的 API Key，用于 qwen3-tts-flash 语音合成。
+            留空则聊天/播报功能不可用（其余功能不受影响）。
+
+    config AMYAI_TTS_MODEL
+        string "TTS 模型"
+        default "qwen3-tts-flash"
+
+    config AMYAI_TTS_VOICE
+        string "音色"
+        default "Cherry"
+        help
+            常用音色：Cherry（女声）、Ethan（男声）等，完整列表见百炼文档。
+
+    config AMYAI_TTS_CONFIRM
+        bool "控制指令成功后语音确认"
+        default y
+        help
+            下发指令并收到主控 ACK 之后，播报一句"好的，帮你按肩膀"这样的确认语。
+            关闭后控制类指令完全静默（更快，但用户不知道有没有执行）。
+
+    config AMYAI_TTS_RATE_PCT
+        int "语速（百分比，100 = 正常）"
+        default 80
+        range 40 150
+        help
+            板载小喇叭音量小、低频重，正常语速容易听不清，默认放慢到 80%。
+            觉得太慢可以调到 90 或 100；觉得还不够清楚可以降到 70。
+
+endmenu
+
+menu "Amyai 交互"
+
+    config AMYAI_FOLLOW_UP_SEC
+        int "连续对话保持时长（秒）"
+        default 600
+        range 3 3600
+        help
+            回复完之后继续聆听多久。这段时间内用户不需要再喊唤醒词。
+            设大（比如 600）适合"一直陪聊"；设小（10~30）更省流量、更不容易被电视等背景音误触发。
+
+endmenu
+
+menu "Amyai 音乐"
+
+    config AMYAI_MUSIC_BASE_URL
+        string "音乐资源根地址"
+        default "http://192.168.1.119:8000"
+        help
+            音乐文件的 HTTP 根地址。开发期可以指向电脑上的本地服务，
+            正式期换成 OSS/CDN 地址。曲库文件名目前硬编码在 music_player.cpp。
+
+endmenu
+
+menu "Amyai 排查开关"
+
+    config AMYAI_SKIP_WIFI_FOR_TEST
+        bool "测试：跳过 WiFi（只跑麦克风，排查断流）"
+        default n
+        help
+            开启后开机不连 WiFi，只启动唤醒/录音链路。
+            用来判断麦克风断流是否和 WiFi/射频/供电有关。
+
+endmenu
