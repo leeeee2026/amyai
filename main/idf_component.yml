@@ -2,5 +2,3 @@ dependencies:
   espressif/cjson: "*"
   espressif/esp-sr: "^2.6.2"
   espressif/esp_codec_dev: "~1.6.2"
-  # ESP-IDF 6.x 起配网组件从核心移出，改名为 network_provisioning
-  espressif/network_provisioning: "^1.4.0"
