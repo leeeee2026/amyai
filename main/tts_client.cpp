@@ -80,11 +80,6 @@ void pipe_reset(int rate, int channels)
     xSemaphoreGive(s_pipe.lock);
 }
 
-size_t pipe_free()
-{
-    return s_pipe.cap - s_pipe.count;
-}
-
 void pipe_push(const uint8_t* data, size_t len)
 {
     if (s_pipe.buf == nullptr || len == 0) {
