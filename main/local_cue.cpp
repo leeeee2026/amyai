@@ -1,5 +1,6 @@
 #include "local_cue.h"
 
+#include <cstdlib>
 #include <cstring>
 
 #include "esp_log.h"
@@ -81,34 +82,57 @@ bool local_is_stop_command(const std::string& text)
 // 所有本地应答都延迟 500ms 再播：用户刚说完话，太快的应答显得很突兀
 constexpr int kLocalAckDelayMs = 500;
 
+// 统一的提示音播放任务体：先暂停录音，再延迟，再播，最后恢复。
+// 顺序很重要——暂停要覆盖"延迟 + 播放"整段时间，否则用户在延迟里说的话会被录进半截。
+void cue_task_body(const int16_t* pcm, size_t len, int rate)
+{
+    wake_pause_listening(true);
+    vTaskDelay(pdMS_TO_TICKS(kLocalAckDelayMs));
+    audio_hub_play_pcm(pcm, len, rate, AUDIO_PRIO_PROMPT);
+    wake_pause_listening(false);
+}
+
+// 创建一个播放任务，失败则立刻恢复暂停状态（否则设备会"失聪"）
+bool spawn_cue(const char* name, const int16_t* pcm, size_t len, int rate, uint32_t stack)
+{
+    struct Args {
+        const int16_t* pcm;
+        size_t len;
+        int rate;
+    };
+    auto* args = static_cast<Args*>(malloc(sizeof(Args)));
+    if (args == nullptr) {
+        return false;
+    }
+    args->pcm = pcm;
+    args->len = len;
+    args->rate = rate;
+    const BaseType_t ok = xTaskCreate(
+        [](void* p) {
+            auto* a = static_cast<Args*>(p);
+            cue_task_body(a->pcm, a->len, a->rate);
+            free(a);
+            vTaskDelete(nullptr);
+        },
+        name, stack, args, 4, nullptr);
+    if (ok != pdPASS) {
+        free(args);
+        ESP_LOGW("cue", "播放任务创建失败（内存不足？）");
+        return false;
+    }
+    return true;
+}
+
 void local_play_ack()
 {
     // 用独立任务播放，避免阻塞主链路（云端请求要马上发出去）
-    xTaskCreate(
-        [](void*) {
-            vTaskDelay(pdMS_TO_TICKS(kLocalAckDelayMs));
-            wake_pause_listening(true);    // 播放期间别录音，否则喇叭声会被录进去
-            audio_hub_play_pcm(kPromptHaoDe, kPromptHaoDeLen, kPromptHaoDeRate,
-                               AUDIO_PRIO_PROMPT);
-            wake_pause_listening(false);
-            vTaskDelete(nullptr);
-        },
-        "ack", 3072, nullptr, 4, nullptr);
+    spawn_cue("ack", kPromptHaoDe, kPromptHaoDeLen, kPromptHaoDeRate, 3072);
 }
 
 // 本地命令词命中：「好的，马上为您调整」
 void local_play_ok()
 {
-    xTaskCreate(
-        [](void*) {
-            vTaskDelay(pdMS_TO_TICKS(kLocalAckDelayMs));
-            wake_pause_listening(true);
-            audio_hub_play_pcm(kPromptHaoOk, kPromptHaoOkLen, kPromptHaoOkRate,
-                               AUDIO_PRIO_PROMPT);
-            wake_pause_listening(false);
-            vTaskDelete(nullptr);
-        },
-        "ackok", 3072, nullptr, 4, nullptr);
+    spawn_cue("ackok", kPromptHaoOk, kPromptHaoOkLen, kPromptHaoOkRate, 3072);
 }
 
 void local_play_no_net()
@@ -121,14 +145,5 @@ void local_play_no_net()
     }
     last_ms = now;
 
-    xTaskCreate(
-        [](void*) {
-            vTaskDelay(pdMS_TO_TICKS(kLocalAckDelayMs));
-            wake_pause_listening(true);
-            audio_hub_play_pcm(kPromptNoNet, kPromptNoNetLen, kPromptNoNetRate,
-                               AUDIO_PRIO_PROMPT);
-            wake_pause_listening(false);
-            vTaskDelete(nullptr);
-        },
-        "nonet", 4096, nullptr, 4, nullptr);
+    spawn_cue("nonet", kPromptNoNet, kPromptNoNetLen, kPromptNoNetRate, 4096);
 }

@@ -1,3 +1,4 @@
+#include "diag.h"
 #include "uart_link.h"
 
 #include <cstdio>
@@ -87,6 +88,13 @@ bool wait_for_ack(uint8_t expect_seq, int timeout_ms)
     while (xTaskGetTickCount() < deadline) {
         int n = uart_read_bytes(kPort, buf + have, sizeof(buf) - have, pdMS_TO_TICKS(20));
         if (n > 0) {
+            // 诊断：把收到的原始字节打出来，确认回程链路是否通
+            char hex[3 * 32 + 4] = {0};
+            int hn = n < 32 ? n : 32;
+            for (int k = 0; k < hn; ++k) {
+                snprintf(hex + k * 3, 4, "%02X ", buf[have + k]);
+            }
+            AMYAI_DIAGI(kTag, "收到 %d 字节原始数据: %s", n, hex);
             have += static_cast<size_t>(n);
 
             size_t i = 0;
@@ -125,6 +133,7 @@ bool wait_for_ack(uint8_t expect_seq, int timeout_ms)
 }
 
 // ---------------------------------------------------------------- 心跳
+#if CONFIG_AMYAI_UART_HEARTBEAT
 void heartbeat_task(void* /*arg*/)
 {
     const uint8_t payload[] = "{\"stat\":\"idle\"}";
@@ -141,6 +150,7 @@ void heartbeat_task(void* /*arg*/)
         vTaskDelay(pdMS_TO_TICKS(CONFIG_AMYAI_UART_HEARTBEAT_MS));
     }
 }
+#endif  // CONFIG_AMYAI_UART_HEARTBEAT
 
 }  // namespace
 
@@ -256,6 +266,14 @@ bool uart_link_send_command(const std::string& json)
         ESP_LOGE(kTag, "组帧失败（payload 太长？）");
         return false;
     }
+
+#if !CONFIG_AMYAI_UART_REQUIRE_ACK
+    // 不需要 ACK：发出去就算完成（主控为模拟器 / 单板联调时的模式）
+    uart_write_bytes(kPort, frame, n);
+    ESP_LOGI(kTag, "发送指令 seq=%u (%d 字节，不等 ACK): %s", seq, n, json.c_str());
+    xSemaphoreGive(s_lock);
+    return true;
+#endif
 
     bool ok = false;
     for (int attempt = 1; attempt <= CONFIG_AMYAI_UART_RETRIES; ++attempt) {

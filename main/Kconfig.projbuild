@@ -164,6 +164,14 @@ menu "Amyai 主控通信（UART）"
         default 300
         range 50 2000
 
+    config AMYAI_UART_REQUIRE_ACK
+        bool "要求主控返回 ACK（关闭则只管发，不等确认）"
+        default y
+        help
+        打开：每条指令都等主控回 ACK，300ms 没回就重传，3 次失败报"未送达"。
+        关闭：发出去就算完成，不等回执、不重传。单板联调 / 主控是模拟器时关掉它，
+        否则日志会一直刷"没有 ACK"。
+
     config AMYAI_UART_RETRIES
         int "重传次数"
         default 3

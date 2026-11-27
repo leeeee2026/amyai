@@ -19,6 +19,7 @@
 #include "driver/i2s_std.h"
 #include "esp_heap_caps.h"
 #include "esp_log.h"
+#include "esp_timer.h"
 #include "esp_system.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -47,7 +48,15 @@ constexpr int kTaskPrio  = 5;
 i2s_chan_handle_t s_tx = nullptr;
 // ★ 提示音播放期间暂停录音：否则喇叭播报会被麦克风录进去，
 //   下一句的音频就和"好的马上为您调整"混在一起，识别必然失败。
-volatile bool s_listen_paused = false;
+//   用计数器而不是 bool：万一两个提示音重叠，先结束的那个不会把后来者的暂停清掉。
+//   另外带 5 秒超时自恢复：任何异常导致暂停没被解除，也不会让设备永远听不见。
+int s_listen_pause_cnt = 0;
+int64_t s_pause_since_us = 0;
+
+// 跨任务读写用原子操作，避免数据竞争，也避开 volatile 自增的编译告警
+inline int pause_cnt_get() { return __atomic_load_n(&s_listen_pause_cnt, __ATOMIC_ACQUIRE); }
+inline void pause_cnt_set(int v) { __atomic_store_n(&s_listen_pause_cnt, v, __ATOMIC_RELEASE); }
+constexpr int64_t kPauseTimeoutUs = 5LL * 1000 * 1000;
 
 const int16_t* s_afe_pcm = nullptr;   // 最近一次录音的 AFE 输出（给离线命令词）
 size_t s_afe_pcm_len = 0;
@@ -285,6 +294,7 @@ void WakeWord::run()
     int fed_chunks = 0;    // 已喂给 AFE 的块数（诊断）
     int res_cnt = 0;       // AFE 返回结果的次数（诊断）
     int last_st = 0;       // 最近一次 AFE 状态（诊断）
+    (void)last_st;
     int l_pk = 0, r_pk = 0;  // 左右声道峰值（诊断）
     bool follow_up_mode = false;   // 连续对话：回复完继续聆听，不用再喊唤醒词
     int follow_up_turns = 0;       // 连续对话轮数
@@ -386,7 +396,8 @@ void WakeWord::run()
             feed[filled++] = v;
 
             // 录音状态：把降采样后的 16k 样本存进缓冲
-            if (recording && s_listen_paused) {
+            const bool listen_paused = (pause_cnt_get() > 0);
+            if (recording && listen_paused) {
                 // 提示音正在播：这期间的音频丢掉，播完从零开始一个新窗口，
                 // 避免喇叭声被录进来污染下一句。
                 rec_fill = 0;
@@ -399,7 +410,7 @@ void WakeWord::run()
                 total_chunks = 0;
                 speech_chunks = 0;
             }
-            if (recording && rec != nullptr && !s_listen_paused) {
+            if (recording && rec != nullptr && !listen_paused) {
                 // ★ 硬保护：绝不能写越界（越界会破坏堆，导致状态机卡死）
                 if (rec_fill < kRecordSamples) {
                     rec[rec_fill++] = v;
@@ -512,6 +523,14 @@ void WakeWord::run()
                             s_afe_pcm_len = static_cast<size_t>(afe_fill);
                             s_afe_pcm_start = static_cast<size_t>(speech_start);
                             on_utterance_(rec, static_cast<size_t>(rec_fill));
+#if AMYAI_DIAG_ENABLE
+                            // 处理完一轮后打一次资源水位：查栈溢出 / 内存泄漏
+                            AMYAI_DIAGI(kTag, "[资源] 唤醒任务剩余栈 %u 字节 | 内部RAM %u 空闲(最大块 %u) | PSRAM %u 空闲",
+                                        static_cast<unsigned>(uxTaskGetStackHighWaterMark(nullptr)),
+                                        static_cast<unsigned>(heap_caps_get_free_size(MALLOC_CAP_INTERNAL)),
+                                        static_cast<unsigned>(heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL)),
+                                        static_cast<unsigned>(heap_caps_get_free_size(MALLOC_CAP_SPIRAM)));
+#endif
                         }
                         rec_fill = 0;
                         afe_fill = 0;
@@ -572,6 +591,12 @@ void WakeWord::run()
                     // 用均值判断"真实音频"：单个 32768 尖峰的均值只有个位数，真实说话在几百以上
                     const bool has_real = (mean > 50);
                     ++log_sec;
+                    // 暂停超时自恢复：防止提示音任务异常导致设备永久"失聪"
+                    if (pause_cnt_get() > 0 &&
+                        esp_timer_get_time() - s_pause_since_us > kPauseTimeoutUs) {
+                        ESP_LOGE(kTag, "提示音暂停超过 5 秒未解除，强制恢复录音");
+                        pause_cnt_set(0);
+                    }
                     if (recording) {
                         AMYAI_DIAGI(kTag, "[录音诊断] fill=%d speech=%d quiet=%d chunks=%d noise=%d 本秒峰值=%d 连续语音块=%d",
                                  rec_fill, speech_seen ? 1 : 0, quiet_chunks,
@@ -641,7 +666,7 @@ void WakeWord::run()
                     ++res_cnt;
                     last_st = res->wakeup_state;
                     // 录音期间把 AFE 处理后的音频存一份（给 MultiNet 用）
-                    if (recording && !s_listen_paused && res->data != nullptr &&
+                    if (recording && pause_cnt_get() == 0 && res->data != nullptr &&
                         res->data_size > 0 && afe_pcm != nullptr) {
                         const int n = res->data_size / static_cast<int>(sizeof(int16_t));
                         if (afe_fill + n <= kRecordSamples) {
@@ -747,7 +772,15 @@ void* wake_model_list() { return static_cast<void*>(s_models); }
 // 提示音播放期间暂停录音：防止喇叭播报被麦克风录进来，污染下一句识别
 void wake_pause_listening(bool pause)
 {
-    s_listen_paused = pause;
+    const int cur = pause_cnt_get();
+    if (pause) {
+        if (cur == 0) {
+            s_pause_since_us = esp_timer_get_time();
+        }
+        pause_cnt_set(cur + 1);
+    } else if (cur > 0) {
+        pause_cnt_set(cur - 1);
+    }
 }
 
 // 取最近一次录音的 AFE 处理后音频（16k 单声道），给离线命令词识别用

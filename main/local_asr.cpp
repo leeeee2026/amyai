@@ -170,6 +170,7 @@ bool local_asr_recognize(const int16_t* pcm, size_t samples, std::string* out_cm
     const int real_chunks = static_cast<int>(samples / static_cast<size_t>(s_chunk));
     const int tail_chunks = 15;   // 15 * 32ms ≈ 480ms 尾部静音
     esp_mn_state_t last_state = ESP_MN_STATE_DETECTING;
+    (void)last_state;   // 诊断关闭时避免 "set but not used" 警告
     for (int ci = 0; ci < real_chunks + tail_chunks; ++ci) {
         const int16_t* block = (ci < real_chunks)
                                    ? (pcm + static_cast<size_t>(ci) * s_chunk)
@@ -191,13 +192,15 @@ bool local_asr_recognize(const int16_t* pcm, size_t samples, std::string* out_cm
             }
         }
     }
+#if AMYAI_DIAG_ENABLE
     {
+        // 诊断：喂进去的音频峰值 + 模型内部识别结果
+        // （正式版这里的整段会被编译掉，不占 CPU）
         int peak = 0;
         for (size_t i = 0; i < samples; ++i) {
             const int a = std::abs(static_cast<int>(pcm[i]));
             if (a > peak) peak = a;
         }
-        // 把模型内部识别到的内容也打出来，判断是"没识别"还是"识别了但没判定命中"
         esp_mn_results_t* r = s_mn->get_results(s_data);
         AMYAI_DIAGI(kTag, "本地未命中（%u ms，峰值 %d）状态=%d 模型识别=\"%s\" 候选=%d",
                  static_cast<unsigned>(samples * 1000 / 16000), peak,
@@ -205,5 +208,6 @@ bool local_asr_recognize(const int16_t* pcm, size_t samples, std::string* out_cm
                  (r != nullptr) ? r->string : "",
                  (r != nullptr) ? r->num : -1);
     }
+#endif
     return false;
 }
