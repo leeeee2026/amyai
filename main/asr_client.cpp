@@ -37,13 +37,22 @@ constexpr const char* kBoundary = "----amyaiBoundary7d3f9a";
 
 constexpr int kTimeoutMs = 30000;
 
+// ★ 复用 TLS 连接：ASR 每次都要握手的话白白多花 400~600ms
+esp_http_client_handle_t s_asr_cli = nullptr;
+std::string* s_cur_resp = nullptr;   // 复用连接时 user_data 固定，用全局指针指向当次响应
+
 esp_err_t on_http_event(esp_http_client_event_t* evt)
 {
-    if (evt->event_id == HTTP_EVENT_ON_DATA && evt->user_data != nullptr) {
+    if (evt->event_id == HTTP_EVENT_ON_DATA) {
         auto* out = static_cast<std::string*>(evt->user_data);
-        if (evt->data != nullptr && evt->data_len > 0) {
-            out->append(static_cast<const char*>(evt->data),
-                        static_cast<size_t>(evt->data_len));
+        if (out == nullptr) {
+            out = s_cur_resp;   // 复用的客户端：user_data 固定为 nullptr
+        }
+        if (out != nullptr) {
+            if (evt->data != nullptr && evt->data_len > 0) {
+                out->append(static_cast<const char*>(evt->data),
+                            static_cast<size_t>(evt->data_len));
+            }
         }
     }
     return ESP_OK;
@@ -92,10 +101,34 @@ std::string asr_transcribe(const int16_t* pcm, size_t samples)
     }
 
     const uint32_t rate = 16000;
-    const uint32_t data_bytes = static_cast<uint32_t>(samples * sizeof(int16_t));
-    if (data_bytes == 0) {
+    if (samples == 0) {
         return {};
     }
+
+    // ★ 裁掉前后静音：唤醒应答前后往往有 0.5~1 秒空白，
+    //   一起上传既慢又让云端多算。留 150ms 余量避免切掉字头。
+    {
+        constexpr int kThresh = 600;          // 静音判断阈值
+        constexpr size_t kMargin = 16000 * 150 / 1000;   // 两侧各留 150ms
+        size_t first = 0;
+        size_t last = samples - 1;
+        while (first < samples && std::abs(static_cast<int>(pcm[first])) < kThresh) ++first;
+        while (last > first && std::abs(static_cast<int>(pcm[last])) < kThresh) --last;
+        if (first < last) {
+            const size_t start = (first > kMargin) ? (first - kMargin) : 0;
+            const size_t end = (last + kMargin < samples) ? (last + kMargin) : (samples - 1);
+            const size_t new_len = end - start + 1;
+            if (new_len + 1600 < samples) {     // 至少省 100ms 才值得裁
+                ESP_LOGI(kTag, "裁静音：%u -> %u 样本（省 %u ms）",
+                         static_cast<unsigned>(samples), static_cast<unsigned>(new_len),
+                         static_cast<unsigned>((samples - new_len) * 1000 / rate));
+                pcm += start;
+                samples = new_len;
+            }
+        }
+    }
+
+    const uint32_t data_bytes = static_cast<uint32_t>(samples * sizeof(int16_t));
 
     // ---- 构造 multipart 请求体 ----
     char head[256];
@@ -147,36 +180,46 @@ std::string asr_transcribe(const int16_t* pcm, size_t samples)
     cfg.url = kUrl;
     cfg.method = HTTP_METHOD_POST;
     cfg.event_handler = on_http_event;
-    cfg.user_data = &response;
+    cfg.user_data = nullptr;   // 用全局 s_cur_resp，便于复用连接
     cfg.crt_bundle_attach = esp_crt_bundle_attach;
     cfg.timeout_ms = kTimeoutMs;
     cfg.buffer_size = 4096;
 
-    // 弱网下 TLS 握手容易超时，失败就重试一次（重建连接）
+    // TLS 握手要 400~600ms，复用连接（keep-alive）能把每次识别省下来；
+    // 失败时丢弃连接重建重试一次。
+    cfg.keep_alive_enable = true;
+
     esp_err_t err = ESP_FAIL;
     int status = 0;
     for (int attempt = 0; attempt < 2; ++attempt) {
-        esp_http_client_handle_t client = esp_http_client_init(&cfg);
-        if (client == nullptr) {
-            free(body);
-            ESP_LOGE(kTag, "HTTP 客户端创建失败");
-            return {};
+        if (s_asr_cli == nullptr) {
+            s_asr_cli = esp_http_client_init(&cfg);
+            if (s_asr_cli == nullptr) {
+                free(body);
+                ESP_LOGE(kTag, "HTTP 客户端创建失败");
+                return {};
+            }
         }
-        esp_http_client_set_header(client, "Content-Type", ctype.c_str());
-        esp_http_client_set_header(client, "Authorization", auth.c_str());
-        esp_http_client_set_post_field(client, reinterpret_cast<const char*>(body), static_cast<int>(total));
+        esp_http_client_set_header(s_asr_cli, "Content-Type", ctype.c_str());
+        esp_http_client_set_header(s_asr_cli, "Authorization", auth.c_str());
+        esp_http_client_set_post_field(s_asr_cli, reinterpret_cast<const char*>(body),
+                                       static_cast<int>(total));
 
         response.clear();
-        err = esp_http_client_perform(client);
-        status = esp_http_client_get_status_code(client);
-        esp_http_client_cleanup(client);
+        s_cur_resp = &response;
+        err = esp_http_client_perform(s_asr_cli);
+        status = esp_http_client_get_status_code(s_asr_cli);
+        s_cur_resp = nullptr;
 
         if (err == ESP_OK && status == 200) {
             break;
         }
-        ESP_LOGW(kTag, "第 %d 次识别失败(err=%s status=%d)，重试一次",
+        ESP_LOGW(kTag, "第 %d 次识别失败(err=%s status=%d)，重连重试",
                  attempt + 1, esp_err_to_name(err), status);
-        vTaskDelay(pdMS_TO_TICKS(500));
+        esp_http_client_cleanup(s_asr_cli);
+        s_asr_cli = nullptr;
+        response.clear();
+        vTaskDelay(pdMS_TO_TICKS(300));
     }
 
     free(body);

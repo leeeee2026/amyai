@@ -250,6 +250,12 @@ struct SseCtx {
     bool error = false;
 };
 
+// ★ 连接复用：TLS 握手要 400~600ms，每句话都重连太浪费。
+//   SSE 回调的 user_data 在 init 时固定，所以用全局指针在每次请求时切换。
+esp_http_client_handle_t s_tts_cli = nullptr;
+int64_t g_tts_t0_us = 0;   // 本次 TTS 开始时刻（算首包延迟）
+SseCtx* s_cur_ctx = nullptr;
+
 // 把一段 PCM 丢进播放管道（非阻塞）
 // 顺便做自动增益：百炼返回的音频峰值只有 0.4~0.5，直接播会比提示音小很多，
 // 这里按峰值慢速归一化到 0.85，让所有语音响度一致。
@@ -345,6 +351,10 @@ void handle_sse_data(SseCtx* ctx, const char* json)
             return;
         }
         ctx->playing = true;
+        if (g_tts_t0_us > 0) {
+            ESP_LOGI(kTag, "[耗时] TTS 首包 %lld ms（含 TLS/排队）",
+                     static_cast<long long>((esp_timer_get_time() - g_tts_t0_us) / 1000));
+        }
         ESP_LOGI(kTag, "首包开播（第 %d 片，%d Hz / %d ch）", ctx->chunks, wi.rate, wi.channels);
         feed_pcm(ctx, wi.pcm, wi.pcm_len);
         ctx->head.clear();
@@ -399,6 +409,8 @@ bool speak_once(const std::string& text)
         return false;
     }
 
+    g_tts_t0_us = esp_timer_get_time();
+
     // 构造请求
     cJSON* root = cJSON_CreateObject();
     cJSON_AddStringToObject(root, "model", CONFIG_AMYAI_TTS_MODEL);
@@ -437,27 +449,48 @@ bool speak_once(const std::string& text)
     cfg.url = kTtsUrl;
     cfg.method = HTTP_METHOD_POST;
     cfg.event_handler = sse_event;
-    cfg.user_data = &ctx;
+    cfg.user_data = nullptr;              // 用全局 s_cur_ctx，便于复用连接
     cfg.crt_bundle_attach = esp_crt_bundle_attach;
     cfg.timeout_ms = 30000;
     cfg.buffer_size = 4096;
+    cfg.keep_alive_enable = true;         // ★ 复用 TLS 连接，省掉每次 400~600ms 握手
 
-    esp_http_client_handle_t cli = esp_http_client_init(&cfg);
-    if (cli == nullptr) {
-        free(ctx.b64);
-        cJSON_free(body);
-        set_error("创建 HTTP 客户端失败");
-        return false;
+    esp_err_t err = ESP_FAIL;
+    int status = 0;
+    for (int attempt = 0; attempt < 2; ++attempt) {
+        if (s_tts_cli == nullptr) {
+            s_tts_cli = esp_http_client_init(&cfg);
+            if (s_tts_cli == nullptr) {
+                break;
+            }
+        }
+        esp_http_client_set_header(s_tts_cli, "Content-Type", "application/json");
+        esp_http_client_set_header(s_tts_cli, "X-DashScope-SSE", "enable");
+        std::string auth = std::string("Bearer ") + key;
+        esp_http_client_set_header(s_tts_cli, "Authorization", auth.c_str());
+        esp_http_client_set_post_field(s_tts_cli, body, static_cast<int>(std::strlen(body)));
+
+        s_cur_ctx = &ctx;
+        ctx.error = false;
+        err = esp_http_client_perform(s_tts_cli);
+        status = esp_http_client_get_status_code(s_tts_cli);
+        s_cur_ctx = nullptr;
+
+        if (err == ESP_OK && status == 200) {
+            break;
+        }
+        // 连接可能已被服务端关闭，扔掉重连一次
+        ESP_LOGW(kTag, "第 %d 次合成失败(err=%s status=%d)，重连重试",
+                 attempt + 1, esp_err_to_name(err), status);
+        if (s_tts_cli != nullptr) {
+            esp_http_client_cleanup(s_tts_cli);
+            s_tts_cli = nullptr;
+        }
+        ctx.line.clear();
+        ctx.head.clear();
+        ctx.playing = false;
+        ctx.chunks = 0;
     }
-    esp_http_client_set_header(cli, "Content-Type", "application/json");
-    esp_http_client_set_header(cli, "X-DashScope-SSE", "enable");
-    std::string auth = std::string("Bearer ") + key;
-    esp_http_client_set_header(cli, "Authorization", auth.c_str());
-    esp_http_client_set_post_field(cli, body, static_cast<int>(std::strlen(body)));
-
-    const esp_err_t err = esp_http_client_perform(cli);
-    const int status = esp_http_client_get_status_code(cli);
-    esp_http_client_cleanup(cli);
     cJSON_free(body);
 
     if (ctx.playing) {

@@ -649,7 +649,9 @@ extern "C" void app_main(void)
             }
 
             // 2. 语音 -> 文字（云端）
+            const int64_t t_cb0 = esp_timer_get_time();
             const std::string text = asr_transcribe(pcm, samples);
+            const int64_t t_asr = (esp_timer_get_time() - t_cb0) / 1000;
             if (text.empty()) {
                 ESP_LOGE(kTag, "语音识别失败");
                 wake.cancel_follow_up();   // 别疯狂重录
@@ -710,7 +712,12 @@ extern "C" void app_main(void)
             }
 
             // 3. 文字 -> 带意图的 JSON（照常走云端，拿到完整回复）
+            const int64_t t_llm0 = esp_timer_get_time();
             const std::string reply = ask_llm(text);
+            const int64_t t_llm = (esp_timer_get_time() - t_llm0) / 1000;
+            ESP_LOGI(kTag, "[耗时] ASR=%lld ms, LLM=%lld ms, 录音结束→LLM完成=%lld ms",
+                     static_cast<long long>(t_asr), static_cast<long long>(t_llm),
+                     static_cast<long long>((esp_timer_get_time() - t_cb0) / 1000));
             if (reply.empty()) {
                 ESP_LOGE(kTag, "大模型调用失败");
                 tts_speak("网络不太好。");
