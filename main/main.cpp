@@ -571,35 +571,6 @@ bool validate_command(const std::string& text)
     return ok;
 }
 
-// 联调用：依次问几句固定的话，把模型返回的文本打到串口
-void run_llm_demo()
-{
-    static const char* kPhrases[] = {
-        "我脖子好酸",
-        "力气太大了",
-        "来个半小时的",
-        "帮我订张机票",
-    };
-
-    ESP_LOGI(kTag, "================ 大模型联调开始 ================");
-    for (const char* phrase : kPhrases) {
-        ESP_LOGI(kTag, "用户: %s", phrase);
-
-        const int64_t t0 = esp_timer_get_time();
-        const std::string reply = ask_llm(phrase);
-        const int64_t cost_ms = (esp_timer_get_time() - t0) / 1000;
-
-        if (reply.empty()) {
-            ESP_LOGE(kTag, "调用失败（耗时 %lld ms）", static_cast<long long>(cost_ms));
-            continue;
-        }
-        ESP_LOGI(kTag, "模型返回（%lld ms）: %s",
-                 static_cast<long long>(cost_ms), reply.c_str());
-        validate_command(reply);
-        vTaskDelay(pdMS_TO_TICKS(1500));
-    }
-    ESP_LOGI(kTag, "================ 大模型联调结束 ================");
-}
 
 }  // namespace
 
@@ -653,10 +624,14 @@ extern "C" void app_main(void)
 
             // ★ 1. 本地命令词快路径：不联网、不花调用费、约 200~400ms
             //   音乐播放中不走这条（避免和"停音乐/换歌"混淆，那条仍交给云端）
+            //   喂给 MultiNet 的是 AFE 处理后的音频（降噪+增益），不是原始录音
+            bool local_acked = false;
             if (!music_is_playing()) {
+                size_t afe_len = 0;
+                const int16_t* afe_pcm = wake_afe_pcm(&afe_len);
                 std::string local_cmd;
-                if (local_asr_recognize(pcm, samples, &local_cmd)) {
-                    local_play_ack();                    // 先秒回「好的」
+                if (afe_pcm != nullptr && local_asr_recognize(afe_pcm, afe_len, &local_cmd)) {
+                    local_play_ok();     // 「好的，马上为您调整」（延迟 500ms 播）
                     if (validate_command(local_cmd)) {
                         if (uart_link_send_command(local_cmd)) {
                             ESP_LOGI(kTag, "【本地】指令已下发主控: %s", local_cmd.c_str());
@@ -668,6 +643,9 @@ extern "C" void app_main(void)
                     }
                     return;                              // 不再走云端
                 }
+                // 本地没命中：先回「好的」，然后照常走云端（延迟 500ms 播）
+                local_play_ack();
+                local_acked = true;
             }
 
             // 2. 语音 -> 文字（云端）
@@ -725,8 +703,8 @@ extern "C" void app_main(void)
                 return;
             }
 
-            // 2. 本地秒回「好的」：控制类的话先立刻回应，主观延迟从 8 秒降到 0.3 秒
-            if (local_is_control(text)) {
+            // 2.5 老的"控制类秒回"只在没走过本地快路径时才需要（音乐窗口等场景）
+            if (!local_acked && local_is_control(text)) {
                 ESP_LOGI(kTag, "本地命中控制类关键词，先播「好的」");
                 local_play_ack();
             }

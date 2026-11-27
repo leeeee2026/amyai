@@ -8,7 +8,9 @@
 #include "freertos/task.h"
 
 #include "audio_hub.h"
+#include "wake_word.h"
 #include "prompt_hao_de.h"
+#include "prompt_hao_ok.h"
 #include "prompt_no_net.h"
 
 namespace {
@@ -76,16 +78,37 @@ bool local_is_stop_command(const std::string& text)
     return false;
 }
 
+// 所有本地应答都延迟 500ms 再播：用户刚说完话，太快的应答显得很突兀
+constexpr int kLocalAckDelayMs = 500;
+
 void local_play_ack()
 {
     // 用独立任务播放，避免阻塞主链路（云端请求要马上发出去）
     xTaskCreate(
         [](void*) {
+            vTaskDelay(pdMS_TO_TICKS(kLocalAckDelayMs));
+            wake_pause_listening(true);    // 播放期间别录音，否则喇叭声会被录进去
             audio_hub_play_pcm(kPromptHaoDe, kPromptHaoDeLen, kPromptHaoDeRate,
                                AUDIO_PRIO_PROMPT);
+            wake_pause_listening(false);
             vTaskDelete(nullptr);
         },
         "ack", 3072, nullptr, 4, nullptr);
+}
+
+// 本地命令词命中：「好的，马上为您调整」
+void local_play_ok()
+{
+    xTaskCreate(
+        [](void*) {
+            vTaskDelay(pdMS_TO_TICKS(kLocalAckDelayMs));
+            wake_pause_listening(true);
+            audio_hub_play_pcm(kPromptHaoOk, kPromptHaoOkLen, kPromptHaoOkRate,
+                               AUDIO_PRIO_PROMPT);
+            wake_pause_listening(false);
+            vTaskDelete(nullptr);
+        },
+        "ackok", 3072, nullptr, 4, nullptr);
 }
 
 void local_play_no_net()
@@ -100,8 +123,11 @@ void local_play_no_net()
 
     xTaskCreate(
         [](void*) {
+            vTaskDelay(pdMS_TO_TICKS(kLocalAckDelayMs));
+            wake_pause_listening(true);
             audio_hub_play_pcm(kPromptNoNet, kPromptNoNetLen, kPromptNoNetRate,
                                AUDIO_PRIO_PROMPT);
+            wake_pause_listening(false);
             vTaskDelete(nullptr);
         },
         "nonet", 4096, nullptr, 4, nullptr);

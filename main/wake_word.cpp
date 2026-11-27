@@ -7,6 +7,7 @@
 //   关键: I2S 必须同时创建 TX 和 RX 通道，否则时钟不跑、麦克风无数据
 //   麦克风: MSM261S4030H0R 数字 I2S 麦克风（数据在右声道）
 
+#include "diag.h"
 #include "wake_word.h"
 
 #include <cmath>
@@ -44,6 +45,13 @@ constexpr int kTaskStack = 20 * 1024;   // TLS 证书校验很吃栈，留足
 constexpr int kTaskPrio  = 5;
 
 i2s_chan_handle_t s_tx = nullptr;
+// ★ 提示音播放期间暂停录音：否则喇叭播报会被麦克风录进去，
+//   下一句的音频就和"好的马上为您调整"混在一起，识别必然失败。
+volatile bool s_listen_paused = false;
+
+const int16_t* s_afe_pcm = nullptr;   // 最近一次录音的 AFE 输出（给离线命令词）
+size_t s_afe_pcm_len = 0;
+size_t s_afe_pcm_start = 0;           // 人声起点（样本下标）：VAD 判定人声的位置 - 300ms
 i2s_chan_handle_t s_rx = nullptr;
 i2c_master_bus_handle_t s_bus = nullptr;
 i2c_master_dev_handle_t s_xl = nullptr;   // XL9555 @0x20，控制功放
@@ -191,6 +199,8 @@ void pa_set(bool on)
 // 放慢到 0.85 倍速播放：小喇叭上太快会听不清，稍微拉长并降低音调更好辨认
 void play_prompt()
 {
+    // 延迟 500ms 再播：和本地应答保持一致的节奏
+    vTaskDelay(pdMS_TO_TICKS(500));
     const int slow_rate = kPromptZaiDeRate * 85 / 100;
     audio_hub_play_pcm(kPromptZaiDe, kPromptZaiDeLen, slow_rate, AUDIO_PRIO_PROMPT);
 }
@@ -269,18 +279,15 @@ void WakeWord::run()
     int16_t tail = 0;      // 上一块最后一个样本（用于跨块插值）
     int filled = 0;        // feed 里已填多少
     int silent_secs = 0;   // 连续静音秒数，用于断流自愈
-    int recover_tries = 0; // 音频恢复尝试次数，超过阈值就整机重启
     int read_fail = 0;     // I2S 读取失败次数（诊断用）
     int good_secs = 0;     // 连续有真实音频的秒数（判定恢复用）
     int log_sec = 0;       // 日志节拍（每 5 秒打一次电平）
-    int diag_sec = 0;      // 诊断打印节拍
     int fed_chunks = 0;    // 已喂给 AFE 的块数（诊断）
     int res_cnt = 0;       // AFE 返回结果的次数（诊断）
     int last_st = 0;       // 最近一次 AFE 状态（诊断）
     int l_pk = 0, r_pk = 0;  // 左右声道峰值（诊断）
     bool follow_up_mode = false;   // 连续对话：回复完继续聆听，不用再喊唤醒词
     int follow_up_turns = 0;       // 连续对话轮数
-    int left_energy = 0, right_energy = 0;
     // ★ 麦克风声道判定：这块板子的数字麦固定只输出在某一路，开机统计 1 秒后锁定，
     //   不要用"开机至今累加"来比较（会 int 溢出，导致选到空声道被误判成断流）
     uint32_t ch_vote_left = 0;
@@ -301,10 +308,26 @@ void WakeWord::run()
     if (rec == nullptr) {
         rec = static_cast<int16_t*>(malloc(kRecordSamples * sizeof(int16_t)));
     }
+    // ★ 同时缓存一份 AFE 处理后的音频（降噪+增益），给离线命令词识别用。
+    //   官方要求 MultiNet 吃 AFE 输出而不是原始麦克风数据，识别率差很多。
+    auto* afe_pcm = static_cast<int16_t*>(
+        heap_caps_malloc(kRecordSamples * sizeof(int16_t), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+    if (afe_pcm == nullptr) {
+        afe_pcm = static_cast<int16_t*>(malloc(kRecordSamples * sizeof(int16_t)));
+    }
+    int afe_fill = 0;
+    s_afe_pcm = afe_pcm;
+    s_afe_pcm_len = 0;
+    AMYAI_DIAGI(kTag, "录音缓冲: rec=%s(%d KB) afe_pcm=%s(%d KB)",
+             rec ? "OK" : "NULL", kRecordSamples * 2 / 1024,
+             afe_pcm ? "OK" : "NULL", kRecordSamples * 2 / 1024);
+
     bool recording = false;
     int rec_fill = 0;
 
     // VAD 断句状态
+    int speech_start = 0;      // 本次录音中人声起点（AFE 缓冲下标）
+    int dbg_pk_max = 0;        // 本秒内 10ms 块的最大峰值（诊断）
     int vad_acc = 0;           // 当前 10ms 块的能量累加
     int vad_n = 0;             // 当前块已累计样本数
     bool speech_seen = false;  // 本次录音是否已经检测到人声
@@ -334,8 +357,6 @@ void WakeWord::run()
             if (la > l_pk) l_pk = la;
             if (ra > r_pk) r_pk = ra;
         }
-        left_energy = le;
-        right_energy = re;
         // 声道判定：前 1 秒（约 86 块）投票，之后锁定，运行期不再切换
         if (!ch_locked) {
             if (le > re) {
@@ -365,8 +386,24 @@ void WakeWord::run()
             feed[filled++] = v;
 
             // 录音状态：把降采样后的 16k 样本存进缓冲
-            if (recording && rec != nullptr) {
-                rec[rec_fill++] = v;
+            if (recording && s_listen_paused) {
+                // 提示音正在播：这期间的音频丢掉，播完从零开始一个新窗口，
+                // 避免喇叭声被录进来污染下一句。
+                rec_fill = 0;
+                afe_fill = 0;
+                speech_start = 0;
+                vad_acc = 0;
+                vad_n = 0;
+                speech_seen = false;
+                quiet_chunks = 0;
+                total_chunks = 0;
+                speech_chunks = 0;
+            }
+            if (recording && rec != nullptr && !s_listen_paused) {
+                // ★ 硬保护：绝不能写越界（越界会破坏堆，导致状态机卡死）
+                if (rec_fill < kRecordSamples) {
+                    rec[rec_fill++] = v;
+                }
 
                 // ---- VAD 断句：用"峰值"判断，说话峰值远大于底噪（实测 7000+ vs 1700）----
                 const uint32_t av = static_cast<uint32_t>(v < 0 ? -v : v);
@@ -388,11 +425,12 @@ void WakeWord::run()
                         noise_pk = (noise_pk * 31 + pk) / 32;
                     }
                     if (noise_pk < 800) noise_pk = 800;
+                    if (pk > dbg_pk_max) dbg_pk_max = pk;
 
                     // 说话阈值：正常要明显高于底噪；音乐窗口要更高（避免喇叭声自激）
                     const int speech_pk_thresh = music_window_
                                                      ? 8000
-                                                     : ((noise_pk * 3 > 3500) ? (noise_pk * 3) : 3500);
+                                                     : ((noise_pk * 3 > 2500) ? (noise_pk * 3) : 2500);
                     const int quiet_pk_thresh = music_window_
                                                     ? 4000
                                                     : ((noise_pk * 2 > 2000) ? (noise_pk * 2) : 2000);
@@ -401,9 +439,18 @@ void WakeWord::run()
                         if (pk > speech_pk_thresh) {
                             ++speech_chunks;
                             quiet_chunks = 0;
-                            if (speech_chunks >= (music_window_ ? 10 : 15)) {
+                            if (speech_chunks >= (music_window_ ? 8 : 10)) {
                                 if (!speech_seen && music_window_) {
                                     ESP_LOGI(kTag, "音乐窗口：检测到人声（峰值 %d）", pk);
+                                }
+                                if (!speech_seen) {
+                                    // ★ 记下人声起点：VAD 判定的这一刻往回留 300ms，
+                                    //   之后直接把 [起点, 结尾] 交给离线识别，不用再猜裁剪位置。
+                                    constexpr int kPreMargin = kAfeRate * 300 / 1000;
+                                    const int at = afe_fill - kPreMargin;
+                                    speech_start = (at > 0) ? at : 0;
+                                    AMYAI_DIAGI(kTag, "人声起点：第 %d 样本（%d ms）",
+                                             speech_start, speech_start * 1000 / kAfeRate);
                                 }
                                 speech_seen = true;
                             }
@@ -427,6 +474,7 @@ void WakeWord::run()
                     recording = false;
                     follow_up_mode = false;
                     rec_fill = 0;
+                    afe_fill = 0;
                     enabled_ = true;
                     ESP_LOGI(kTag, "连续对话窗口结束（没听到说话），回到唤醒词模式");
                 } else if (vad_done || rec_fill >= rec_limit) {
@@ -434,6 +482,7 @@ void WakeWord::run()
                     // ★ 整段都没检测到人声：不送云端识别（否则 ASR 返回乱码，白花一次调用）
                     if (!speech_seen) {
                         rec_fill = 0;
+                        afe_fill = 0;
                         vad_acc = 0;
                         vad_n = 0;
                         quiet_chunks = 0;
@@ -455,14 +504,18 @@ void WakeWord::run()
                             ESP_LOGI(kTag, "没听到人声，回到唤醒词模式");
                         }
                     } else {
-                        ESP_LOGI(kTag, "录音结束：%d 样本（%.1f 秒）%s", rec_fill,
+                        AMYAI_DIAGI(kTag, "录音结束：%d 样本（%.1f 秒）%s", rec_fill,
                                  static_cast<float>(rec_fill) / kAfeRate,
                                  vad_done ? "，VAD 断句" : "，录满上限");
 
                         if (on_utterance_) {
+                            s_afe_pcm_len = static_cast<size_t>(afe_fill);
+                            s_afe_pcm_start = static_cast<size_t>(speech_start);
                             on_utterance_(rec, static_cast<size_t>(rec_fill));
                         }
                         rec_fill = 0;
+                        afe_fill = 0;
+                        speech_start = 0;
                         // 处理完（ASR+大模型，几秒）再恢复唤醒检测，并丢弃期间堆积的音频
                         size_t drained = 0;
                         while (i2s_channel_read(s_rx, hw, sizeof(hw), &drained, 0) == ESP_OK && drained > 0) {
@@ -472,6 +525,7 @@ void WakeWord::run()
                         if (music_window_) {
                             // 音乐窗口：处理完继续监听下一条短指令
                             rec_fill = 0;
+                            afe_fill = 0;
                             vad_acc = 0;
                             vad_n = 0;
                             speech_seen = false;
@@ -490,6 +544,7 @@ void WakeWord::run()
                             ESP_LOGI(kTag, "已取消连续聆听，回到唤醒词模式");
                         } else if (follow_up_mode && !music_is_playing() && ++follow_up_turns < 200) {
                             rec_fill = 0;
+                            afe_fill = 0;
                             vad_acc = 0;
                             vad_n = 0;
                             speech_seen = false;
@@ -517,8 +572,29 @@ void WakeWord::run()
                     // 用均值判断"真实音频"：单个 32768 尖峰的均值只有个位数，真实说话在几百以上
                     const bool has_real = (mean > 50);
                     ++log_sec;
+                    if (recording) {
+                        AMYAI_DIAGI(kTag, "[录音诊断] fill=%d speech=%d quiet=%d chunks=%d noise=%d 本秒峰值=%d 连续语音块=%d",
+                                 rec_fill, speech_seen ? 1 : 0, quiet_chunks,
+                                 total_chunks, noise_pk, dbg_pk_max, speech_chunks);
+                        dbg_pk_max = 0;
+                        // ★ 保险：缓冲写满却没结束，说明判定逻辑异常，强制收尾（防止卡死）
+                        if (rec_fill >= kRecordSamples) {
+                            AMYAI_DIAGE(kTag, "录音缓冲写满仍未结束，强制收尾（丢弃本次录音）");
+                            recording = false;
+                            rec_fill = 0;
+                            afe_fill = 0;
+                            vad_acc = 0;
+                            vad_n = 0;
+                            speech_seen = false;
+                            quiet_chunks = 0;
+                            total_chunks = 0;
+                            speech_chunks = 0;
+                            enabled_ = true;
+                            follow_up_mode = false;
+                        }
+                    }
                     if ((log_sec % 5) == 0) {
-                        ESP_LOGI(kTag, "MIC 峰值=%u 均值=%u | L=%d R=%d 用%s | AFE: 结果 %d, 状态 %d",
+                        AMYAI_DIAGI(kTag, "MIC 峰值=%u 均值=%u | L=%d R=%d 用%s | AFE: 结果 %d, 状态 %d",
                                  static_cast<unsigned>(lvl_max),
                                  static_cast<unsigned>(mean),
                                  l_pk, r_pk, use_left ? "左" : "右",
@@ -542,7 +618,6 @@ void WakeWord::run()
                     if (good_secs >= 3) {
                         // 连续 3 秒有真实声音：确认已恢复
                         silent_secs = 0;
-                        recover_tries = 0;
                     } else if (silent_now) {
                         ++silent_secs;
                     }
@@ -565,10 +640,24 @@ void WakeWord::run()
                 if (res != nullptr && res->ret_value != -1) {
                     ++res_cnt;
                     last_st = res->wakeup_state;
-                    if (res->wakeup_state == WAKENET_DETECTED) {
-                        ESP_LOGW(kTag, "AFE 检测到唤醒词！enabled_=%d", enabled_ ? 1 : 0);
+                    // 录音期间把 AFE 处理后的音频存一份（给 MultiNet 用）
+                    if (recording && !s_listen_paused && res->data != nullptr &&
+                        res->data_size > 0 && afe_pcm != nullptr) {
+                        const int n = res->data_size / static_cast<int>(sizeof(int16_t));
+                        if (afe_fill + n <= kRecordSamples) {
+                            std::memcpy(afe_pcm + afe_fill, res->data, res->data_size);
+                            afe_fill += n;
+                            s_afe_pcm_len = afe_fill;
+                        }
                     }
-                    if (res->wakeup_state == WAKENET_DETECTED && enabled_) {
+                    if (res->wakeup_state == WAKENET_DETECTED) {
+                        AMYAI_DIAGW(kTag, "AFE 检测到唤醒词！enabled_=%d", enabled_ ? 1 : 0);
+                    }
+                    // ★ 只要听到唤醒词就一定回应：即使正在录音/聆听中也重新开始一轮
+                    if (res->wakeup_state == WAKENET_DETECTED) {
+                        if (!enabled_) {
+                            ESP_LOGI(kTag, "录音中再次听到唤醒词，重新开始一轮");
+                        }
                         ESP_LOGI(kTag, "★ 唤醒命中: \"%s\"", CONFIG_AMYAI_WAKE_TEXT);
                         enabled_ = false;   // 录音+处理期间不再响应唤醒，避免连续触发
                         if (on_wake_) {
@@ -577,6 +666,7 @@ void WakeWord::run()
                         play_prompt();          // 先回一句「在的」
                         recording = true;
                         rec_fill = 0;
+                        afe_fill = 0;
                         vad_acc = 0;
                         vad_n = 0;
                         speech_seen = false;
@@ -594,6 +684,7 @@ void WakeWord::run()
             if (music_window_ && enabled_ && !recording && s_tx != nullptr) {
                 recording = true;
                 rec_fill = 0;
+                afe_fill = 0;
                 vad_acc = 0;
                 vad_n = 0;
                 speech_seen = false;
@@ -613,6 +704,7 @@ void WakeWord::run()
                 follow_up_turns = 0;
                 recording = true;
                 rec_fill = 0;
+                afe_fill = 0;
                 vad_acc = 0;
                 vad_n = 0;
                 speech_seen = false;
@@ -651,3 +743,21 @@ bool WakeWord::start(OnWake on_wake, OnUtterance on_utterance)
 
 // 供离线命令词模块复用模型表（AFE 初始化时已 mmap 好 model 分区）
 void* wake_model_list() { return static_cast<void*>(s_models); }
+
+// 提示音播放期间暂停录音：防止喇叭播报被麦克风录进来，污染下一句识别
+void wake_pause_listening(bool pause)
+{
+    s_listen_paused = pause;
+}
+
+// 取最近一次录音的 AFE 处理后音频（16k 单声道），给离线命令词识别用
+const int16_t* wake_afe_pcm(size_t* samples)
+{
+    // ★ 直接从人声起点返回，调用方不用再做静音裁剪
+    if (s_afe_pcm == nullptr || s_afe_pcm_len <= s_afe_pcm_start) {
+        if (samples != nullptr) *samples = 0;
+        return s_afe_pcm;
+    }
+    if (samples != nullptr) *samples = s_afe_pcm_len - s_afe_pcm_start;
+    return s_afe_pcm + s_afe_pcm_start;
+}
