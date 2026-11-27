@@ -263,11 +263,11 @@ void reader_task(void*)
 void player_task(void*)
 {
     static int16_t pcm[2048];
-    constexpr int kPrebufferBytes = 16000 * 2;   // 约 1 秒（16kHz 16bit）
+    constexpr size_t kPrebufferBytes = 8000;   // 约 250ms（16kHz 16bit），够起播即可
 
     ESP_LOGI(kTag, "播放任务启动，等待预缓冲…");
     int wait_ms = 0;
-    while (!s_stop && s_ring.count < 8000 && s_ring.eof == false && wait_ms < 5000) {
+    while (!s_stop && s_ring.count < kPrebufferBytes && s_ring.eof == false && wait_ms < 5000) {
         vTaskDelay(pdMS_TO_TICKS(20));
         wait_ms += 20;
     }
