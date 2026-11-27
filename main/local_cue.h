@@ -19,8 +19,11 @@ bool local_is_control(const std::string& text);
 // 判定从严：必须是短句（<=10 字）且明确含停止词，避免把闲聊误判成停止。
 bool local_is_stop_command(const std::string& text);
 
-// 异步播放「好的」应答音（不阻塞，播完自动释放任务）
+// 异步播放「好的」应答音（不阻塞；延迟 500ms 再播）
 void local_play_ack();
+
+// 异步播放「好的，马上为您调整」（本地命令词命中时用；同样延迟 500ms）
+void local_play_ok();
 
 // 播放「网络还没连上，请稍等」提示音（本地音频，不依赖网络；有 15 秒冷却，避免刷屏）
 void local_play_no_net();

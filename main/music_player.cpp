@@ -356,6 +356,13 @@ static bool start_track(const char* file, const char* name)
 {
     if (s_playing) {
         music_stop();
+        // ★ 旧任务（reader/player）必须彻底退出后才能开新曲目：
+        //   否则两套任务会共用同一份环形缓冲和 static PCM 缓冲，
+        //   旧任务的 audio_hub_stream_end() 还会把新曲目的音频流关掉。
+        if (s_playing) {
+            ESP_LOGW(kTag, "上一曲的播放任务还没退出，本轮拒绝启动新曲目");
+            return false;
+        }
     }
     if (!music_ensure_ring()) {
         return false;
@@ -431,6 +438,10 @@ void music_stop()
     s_stop = true;
     for (int i = 0; i < 30 && s_playing; ++i) {
         vTaskDelay(pdMS_TO_TICKS(100));
+    }
+    if (s_playing) {
+        // 3 秒还没退出：不硬删任务（会踩已持有的锁），只记录，下次 start_track 会拒绝启动
+        ESP_LOGE(kTag, "播放任务 3 秒内未退出（s_playing 仍为真）");
     }
     music_reset_ring();
     audio_hub_set_music_volume(100);   // 监听时压低过音乐音量，停止后恢复

@@ -4,6 +4,19 @@
 #include <cstdint>
 #include <functional>
 
+// 拿到底层 esp-sr 的模型表（AFE 初始化时已经把 model 分区的模型映射好），
+// 给离线命令词识别模块复用，避免重复 mmap。
+// 返回 void* 是为了不把 esp-sr 的头文件传染到这里，调用方自己转成 srmodel_list_t*。
+void* wake_model_list();
+
+// 取最近一次录音的 AFE 处理后音频（16k / 16bit / 单声道），给离线命令词识别用。
+// 官方要求 MultiNet 吃 AFE 输出而不是原始麦克风数据，识别率高很多。
+// 返回 nullptr 表示本次没有可用数据。
+const int16_t* wake_afe_pcm(size_t* samples);
+
+// 提示音播放期间暂停/恢复录音（防止喇叭播报被麦克风录进去干扰下一句）
+void wake_pause_listening(bool pause);
+
 // 离线唤醒词（esp-sr WakeNet）+ 唤醒后录音
 //
 // 用法：

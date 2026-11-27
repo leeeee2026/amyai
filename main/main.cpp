@@ -34,6 +34,7 @@
 #include "llm_client.h"
 #include "tts_client.h"
 #include "local_cue.h"
+#include "local_asr.h"
 #include "music_player.h"
 #include "uart_link.h"
 #include "wake_word.h"
@@ -570,35 +571,6 @@ bool validate_command(const std::string& text)
     return ok;
 }
 
-// 联调用：依次问几句固定的话，把模型返回的文本打到串口
-void run_llm_demo()
-{
-    static const char* kPhrases[] = {
-        "我脖子好酸",
-        "力气太大了",
-        "来个半小时的",
-        "帮我订张机票",
-    };
-
-    ESP_LOGI(kTag, "================ 大模型联调开始 ================");
-    for (const char* phrase : kPhrases) {
-        ESP_LOGI(kTag, "用户: %s", phrase);
-
-        const int64_t t0 = esp_timer_get_time();
-        const std::string reply = ask_llm(phrase);
-        const int64_t cost_ms = (esp_timer_get_time() - t0) / 1000;
-
-        if (reply.empty()) {
-            ESP_LOGE(kTag, "调用失败（耗时 %lld ms）", static_cast<long long>(cost_ms));
-            continue;
-        }
-        ESP_LOGI(kTag, "模型返回（%lld ms）: %s",
-                 static_cast<long long>(cost_ms), reply.c_str());
-        validate_command(reply);
-        vTaskDelay(pdMS_TO_TICKS(1500));
-    }
-    ESP_LOGI(kTag, "================ 大模型联调结束 ================");
-}
 
 }  // namespace
 
@@ -632,14 +604,51 @@ extern "C" void app_main(void)
             llm_reset_history();    // 新的一段会话，清空对话上下文
         },
         [&](const int16_t* pcm, size_t samples) {
-            // 0. 网络没就绪就别浪费一次上传和识别（刚开机 WiFi 可能要几秒到几十秒）
+            // 0. 网络没就绪时，仍然给离线命令词一个机会（这正是本地识别最大的价值）
             if (!g_net_ready) {
+                std::string local_cmd;
+                if (!music_is_playing() && local_asr_recognize(pcm, samples, &local_cmd)) {
+                    ESP_LOGI(kTag, "【本地】网络未就绪，但本地识别命中，直接执行");
+                    local_play_ack();
+                    if (validate_command(local_cmd)) {
+                        uart_link_send_command(local_cmd);
+                    }
+                    wake.cancel_follow_up();
+                    return;
+                }
                 ESP_LOGW(kTag, "网络还没连上，播放本地提示音");
                 local_play_no_net();   // 本地音频，不依赖网络；15 秒冷却
                 wake.cancel_follow_up();
                 return;
             }
-            // 1. 语音 -> 文字
+
+            // ★ 1. 本地命令词快路径：不联网、不花调用费、约 200~400ms
+            //   音乐播放中不走这条（避免和"停音乐/换歌"混淆，那条仍交给云端）
+            //   喂给 MultiNet 的是 AFE 处理后的音频（降噪+增益），不是原始录音
+            bool local_acked = false;
+            if (!music_is_playing()) {
+                size_t afe_len = 0;
+                const int16_t* afe_pcm = wake_afe_pcm(&afe_len);
+                std::string local_cmd;
+                if (afe_pcm != nullptr && local_asr_recognize(afe_pcm, afe_len, &local_cmd)) {
+                    local_play_ok();     // 「好的，马上为您调整」（延迟 500ms 播）
+                    if (validate_command(local_cmd)) {
+                        if (uart_link_send_command(local_cmd)) {
+                            ESP_LOGI(kTag, "【本地】指令已下发主控: %s", local_cmd.c_str());
+                        } else {
+                            ESP_LOGW(kTag, "【本地】下发失败: %s", local_cmd.c_str());
+                        }
+                    } else {
+                        ESP_LOGW(kTag, "【本地】指令校验未通过: %s", local_cmd.c_str());
+                    }
+                    return;                              // 不再走云端
+                }
+                // 本地没命中：先回「好的」，然后照常走云端（延迟 500ms 播）
+                local_play_ack();
+                local_acked = true;
+            }
+
+            // 2. 语音 -> 文字（云端）
             const std::string text = asr_transcribe(pcm, samples);
             if (text.empty()) {
                 ESP_LOGE(kTag, "语音识别失败");
@@ -694,8 +703,8 @@ extern "C" void app_main(void)
                 return;
             }
 
-            // 2. 本地秒回「好的」：控制类的话先立刻回应，主观延迟从 8 秒降到 0.3 秒
-            if (local_is_control(text)) {
+            // 2.5 老的"控制类秒回"只在没走过本地快路径时才需要（音乐窗口等场景）
+            if (!local_acked && local_is_control(text)) {
                 ESP_LOGI(kTag, "本地命中控制类关键词，先播「好的」");
                 local_play_ack();
             }
@@ -795,6 +804,20 @@ extern "C" void app_main(void)
             }
             cJSON_Delete(root);
         });
+    // ★ 离线命令词识别（MultiNet）：放到独立任务里延迟初始化。
+    //   原因：MultiNet 加载模型要 1.5~2 秒，如果放在唤醒监听启动的同一个上下文里跑，
+    //   会把 I2S 读取堵住，麦克风直接断流重启。延迟到系统稳定后再建。
+    xTaskCreate(
+        [](void*) {
+            vTaskDelay(pdMS_TO_TICKS(6000));   // 等麦克风声道锁定、网络起来
+            if (local_asr_init()) {
+                ESP_LOGI(kTag, "离线命令词识别已启用（唤醒后先本地识别，未命中再走云端）");
+            } else {
+                ESP_LOGW(kTag, "离线命令词识别未启用，全部走云端");
+            }
+            vTaskDelete(nullptr);
+        },
+        "asr_init", 10 * 1024, nullptr, 2, nullptr);
 
     if (wake_ok) {
         ESP_LOGI(kTag, "等待唤醒词: \"%s\"", CONFIG_AMYAI_WAKE_TEXT);
