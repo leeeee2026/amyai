@@ -127,23 +127,25 @@ void write_resampled(const int16_t* pcm, size_t count, int src_rate, float* phas
 
 }  // namespace
 
-// 保活任务：平时没人往 I2S TX 写数据，DMA 会空转。
-// 这块板子的 I2S 时钟疑似依赖 TX 在跑，所以要定期喂一点静音，别让 TX 停摆。
+// 保活任务：这块板子是全双工 I2S（TX 做 master，RX 做 slave），
+// **BCLK/LRCLK 只在 TX 有数据时才会输出**。TX 一停，数字麦克风就没了时钟，
+// 采到的全是 0 —— 表现就是"麦克风断流"。
+// 所以空闲时必须持续喂静音，让时钟连轴转（阻塞写，由驱动按采样率自然限速）。
 static void keepalive_task(void*)
 {
-    static int16_t sil[256] = {};   // 128 帧立体声静音
+    static int16_t sil[256 * 2] = {};   // 256 帧立体声静音（约 5.8ms）
     static int quiet_rounds = 0;
     while (true) {
-        // 只有在没人播放、且通道确认可用时才喂
         if (!s_busy && s_tx != nullptr) {
             if (xSemaphoreTake(s_lock, 0) == pdTRUE) {
                 if (!s_busy && s_tx != nullptr) {
                     size_t written = 0;
-                    const esp_err_t r = i2s_channel_write(s_tx, sil, sizeof(sil), &written, 0);
+                    // 用 200ms 超时阻塞写：DMA 满了就等，形成和采样率一致的稳定节奏
+                    const esp_err_t r = i2s_channel_write(s_tx, sil, sizeof(sil), &written,
+                                                          pdMS_TO_TICKS(200));
                     if (r != ESP_OK) {
-                        // 通道被临时禁用（恢复流程），别刷屏
                         if (++quiet_rounds <= 2) {
-                            ESP_LOGD(kTag, "保活写入暂不可用");
+                            ESP_LOGW(kTag, "保活写入失败: %s", esp_err_to_name(r));
                         }
                     } else {
                         quiet_rounds = 0;
@@ -151,8 +153,10 @@ static void keepalive_task(void*)
                 }
                 xSemaphoreGive(s_lock);
             }
+            vTaskDelay(1);   // 让出 CPU，下一轮继续喂
+        } else {
+            vTaskDelay(pdMS_TO_TICKS(20));
         }
-        vTaskDelay(pdMS_TO_TICKS(100));
     }
 }
 

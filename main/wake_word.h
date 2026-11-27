@@ -4,6 +4,11 @@
 #include <cstdint>
 #include <functional>
 
+// 拿到底层 esp-sr 的模型表（AFE 初始化时已经把 model 分区的模型映射好），
+// 给离线命令词识别模块复用，避免重复 mmap。
+// 返回 void* 是为了不把 esp-sr 的头文件传染到这里，调用方自己转成 srmodel_list_t*。
+void* wake_model_list();
+
 // 离线唤醒词（esp-sr WakeNet）+ 唤醒后录音
 //
 // 用法：

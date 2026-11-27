@@ -648,3 +648,6 @@ bool WakeWord::start(OnWake on_wake, OnUtterance on_utterance)
     ESP_LOGI(kTag, "唤醒监听已启动，请说：\"%s\"", CONFIG_AMYAI_WAKE_TEXT);
     return true;
 }
+
+// 供离线命令词模块复用模型表（AFE 初始化时已 mmap 好 model 分区）
+void* wake_model_list() { return static_cast<void*>(s_models); }
