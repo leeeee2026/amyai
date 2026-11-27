@@ -363,6 +363,16 @@ void WakeWord::run()
 
     while (true) {
         // 配置模式暂停：不读 I2S、不喂 AFE，把 CPU 和音频通道让给配置页面
+        // 空闲时也要处理休眠请求（配置模式退出会调用 sleep_now()，那时没有录音回调）
+        if (sleep_request_ && !recording) {
+            sleep_request_ = false;
+            sleeping_ = true;
+            follow_up_mode = false;
+            follow_up_turns = 0;
+            enabled_ = false;
+            ESP_LOGI(kTag, "已休眠：停止响应，需重新喊唤醒词");
+        }
+
         if (pause_request_) {
             if (recording) {
                 recording = false;

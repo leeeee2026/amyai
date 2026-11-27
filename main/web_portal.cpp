@@ -26,6 +26,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "web_page.h"
+#include "wifi_prov.h"
 
 namespace {
 
@@ -50,8 +51,6 @@ struct ApItem {
 };
 std::vector<ApItem> s_scan_cache;
 
-// 保存成功后延时重启的标记（Wi-Fi 配置保存）
-volatile bool s_saved = false;
 // 身体信息保存标记（保存后重启进入正常模式）
 volatile bool s_profile_saved = false;
 // Wi-Fi 已提交，需要去连接（配网页提交后触发，不重启）
@@ -162,8 +161,15 @@ void do_scan()
 // 设备是否已有 Wi-Fi 凭据（决定显示哪个页面）
 bool has_wifi_credentials()
 {
+    // 新方案：我们自己的 NVS 记录
     char ssid[33] = {0};
-    return user_wifi_load(ssid, sizeof(ssid), nullptr, 0);
+    if (user_wifi_load(ssid, sizeof(ssid), nullptr, 0)) {
+        return true;
+    }
+    // 兜底：老版本用 BLE 配网时凭据存在 WiFi 驱动里，这类设备也算"已配网"
+    std::string legacy_ssid;
+    std::string legacy_pwd;
+    return prov_load_credentials(legacy_ssid, legacy_pwd);
 }
 
 esp_err_t handle_root(httpd_req_t* req)

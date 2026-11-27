@@ -650,10 +650,11 @@ extern "C" void app_main(void)
 
 
     // 唤醒词：不依赖 Wi-Fi，先启动。引脚没配好时只报警告，不影响后面的联网流程。
+#if CONFIG_AMYAI_AUDIO_PROBE
     // ★ 诊断：I2S 初始化前，把麦克风数据脚（IO47）当普通 GPIO 读电平，
     //   判断是"线悬空（麦没驱动）"还是"被拉低（短路/麦不出数据）"。
     {
-        const gpio_num_t kMicPin = GPIO_NUM_47;
+        const gpio_num_t kMicPin = static_cast<gpio_num_t>(CONFIG_AMYAI_I2S_DIN);
         auto probe = [&](bool pull_up, const char* name) {
             gpio_config_t io = {};
             io.pin_bit_mask = 1ULL << kMicPin;
@@ -676,6 +677,8 @@ extern "C" void app_main(void)
         ESP_LOGW(kTag, "[麦克风线] 判读：上拉读 1 且下拉读 0 = 线悬空（麦没驱动）；"
                        "两次都 0 = 被拉低；两次都 1 = 被拉高");
     }
+
+#endif
 
     static WakeWord wake;
     const bool wake_ok = wake.start(
@@ -980,24 +983,6 @@ extern "C" void app_main(void)
         ESP_LOGW(kTag, "唤醒功能未启动（多半是 I2S 引脚没配置），继续跑联网部分");
     }
 
-    // ★ 开机自检音：必须放在 wake.start() 之后 —— 音频总线在那里才初始化好，
-    //   早于它调用 audio_hub_play_pcm 会因为 s_tx == nullptr 直接静默返回。
-    if (wake_ok) {
-        static int16_t beep[24000];   // 1 秒 @24kHz 单声道
-        for (int i = 0; i < 24000; ++i) {
-            float env = 1.0f;
-            if (i < 1200) env = static_cast<float>(i) / 1200.0f;
-            else if (i > 22800) env = static_cast<float>(24000 - i) / 1200.0f;
-            // 440Hz 方波，幅度拉满到 24000（约 73%），比之前响很多
-            beep[i] = static_cast<int16_t>(24000.0f * env * (((i / 27) % 2) ? 1.0f : -1.0f));
-        }
-        for (int k = 0; k < 3; ++k) {
-            const bool ok = audio_hub_play_pcm(beep, 24000, 24000, AUDIO_PRIO_PROMPT);
-            ESP_LOGW(kTag, "开机自检音 #%d 播放%s（应该能听到 1 秒嘀声）",
-                     k + 1, ok ? "完成" : "失败");
-            vTaskDelay(pdMS_TO_TICKS(300));
-        }
-    }
 
     // 开机内存快照：内部 RAM 是本板最紧张的资源（WiFi + TLS 都从这里要）
     AMYAI_DIAGI(kTag, "[内存] 连网前：内部 %u 空闲（最大块 %u）| PSRAM %u 空闲",
@@ -1072,6 +1057,14 @@ extern "C" void app_main(void)
 
         // ---- 每 2 秒处理一次配置模式 ----
         if (++tick % 4 == 0) {
+            // 兜底：如果手机在网络就绪之前就连上了，事件会漏掉，这里主动查一次
+            if (!g_ap_client_connected && !cfg_active) {
+                wifi_sta_list_t sta_list = {};
+                if (esp_wifi_ap_get_sta_list(&sta_list) == ESP_OK && sta_list.num > 0) {
+                    g_ap_client_connected = true;
+                    ESP_LOGW(kTag, "检测到手机接入设备 AP（轮询兜底）");
+                }
+            }
             const bool want = g_ap_client_connected;
             if (!want) {
                 wait_disconnect = false;   // 手机断开了，下次接入可以重新进入

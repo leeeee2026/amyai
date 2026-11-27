@@ -51,9 +51,6 @@ menu "Amyai 音频硬件"
         int "I2S DOUT 引脚（ESP32 数据进 codec，-1 = 未配置）"
         default -1
 
-    config AMYAI_PA_PIN
-        int "功放使能引脚（-1 = 没有）"
-        default -1
 
 endmenu
 
@@ -77,46 +74,37 @@ menu "Amyai 唤醒词"
 
 endmenu
 
-menu "Amyai 配网（BLE）"
+menu "Amyai 配网与出厂重置"
 
     config AMYAI_PROV_ENABLE
-        bool "启用 BLE 配网"
+        bool "启用网页配网"
         default y
         help
-            开启后，设备在没有保存 Wi-Fi 凭据时会自动进入蓝牙配网模式，
-            手机用 ESP BLE Provisioning App 下发 SSID 和密码。
-
-    config AMYAI_PROV_POP
-        string "配网密码 (PoP)"
-        default "abcd1234"
-        help
-            Proof of Possession，手机 App 配网时需要输入。
-            量产时建议改成每台设备唯一的随机值（例如印在机身标签上）。
-
-    config AMYAI_PROV_NAME_PREFIX
-        string "蓝牙设备名前缀"
-        default "AMYAI"
-        help
-            实际广播的名字是「前缀_MAC后6位」，例如 AMYAI_A1B2C3，方便区分多台设备。
-
-    config AMYAI_PROV_TIMEOUT_SEC
-        int "配网等待超时（秒）"
-        default 300
-        range 30 3600
-        help
-            超过这个时间还没配好，就关掉蓝牙，避免一直占着内存和功耗。
+            设备没有保存 Wi-Fi 凭据时自动进入网页配网模式：
+            开隐藏 AP（AMYAI-CHAIR）+ HTTP 服务，手机扫码连上后打开
+            192.168.4.1 填写 Wi-Fi 和身体信息。
+            配网方式已由蓝牙改为网页，不再需要蓝牙协议栈。
 
     config AMYAI_PROV_RESET_GPIO
-        int "恢复出厂按键 GPIO（-1 = 禁用）"
+        int "恢复出厂按键 GPIO（-1 = 不使用）"
         default 0
         help
-            开机时按住这个引脚（低电平，开发板 BOOT 键即 GPIO0）达到设定时长，
-            会清除已保存的 Wi-Fi 凭据并重新进入配网。
+            开机时按住这个按键（低电平有效）超过设定时间，会清除已保存的
+            Wi-Fi 凭据和用户信息，下次启动重新进入网页配网模式。
+            DNESP32S3B 的 BOOT 键接 GPIO0。
 
     config AMYAI_PROV_RESET_HOLD_MS
-        int "恢复出厂按住时长（毫秒）"
+        int "恢复出厂按键按住时长（毫秒）"
         default 3000
-        range 500 20000
+        depends on AMYAI_PROV_RESET_GPIO >= 0
+
+    config AMYAI_AUDIO_PROBE
+        bool "开机时探测音频引脚电平（硬件排查用）"
+        default n
+        help
+            开机时把麦克风数据脚当普通 GPIO，分别加上拉/下拉各读 200 次，
+            用来判断是"线悬空"还是"被拉死"。会额外占用约 0.8 秒启动时间，
+            只在硬件排查时打开。
 
 endmenu
 
