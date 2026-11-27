@@ -122,6 +122,16 @@ endmenu
 
 menu "Amyai 主控通信（UART）"
 
+    config AMYAI_MUSIC_DUCK_PERCENT
+        int "放音乐时压低到的音量百分比（音乐窗口监听用）"
+        default 40
+        range 5 90
+        help
+        放音乐时为了让麦克风听清人声，会把音乐音量压低到这个百分比。
+        压低越多，越容易识别"换一首/停"这类指令，但音乐越小；
+        压低越少，音乐越好听，但人声可能被音乐盖住识别不到。
+        实测参考：20% 识别可靠但音乐太小；40% 音乐勉强可听，人声仍能过阈值。
+
     config AMYAI_UART_ENABLE
         bool "启用 UART 指令发送"
         default y

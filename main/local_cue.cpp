@@ -147,3 +147,22 @@ void local_play_no_net()
 
     spawn_cue("nonet", kPromptNoNet, kPromptNoNetLen, kPromptNoNetRate, 4096);
 }
+
+// 音乐窗口专用：这句话像不像"音乐操作"指令。
+// 音乐播放时 ASR 经常把音乐声识别成 "Okay." / "#" 之类的碎片，
+// 这类必须直接忽略，不能停音乐、更不能送去大模型（否则会冒出莫名其妙的兜底回复）。
+bool local_is_music_command(const std::string& text)
+{
+    // 只认"换歌/下一首"这类明确指令。
+    // 不要用单字"听""歌"当关键词：音乐声被识别成"听不清"时会误触发。
+    static const char* kWords[] = {
+        "换一", "换首", "换歌", "下一首", "下一个", "上一首", "上一个",
+        "再来一首", "再来个", "别放了", "关了吧",
+    };
+    for (const char* w : kWords) {
+        if (text.find(w) != std::string::npos) {
+            return true;
+        }
+    }
+    return false;
+}

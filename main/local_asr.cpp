@@ -35,7 +35,7 @@ namespace {
 constexpr const char* kTag = "localasr";
 
 // 一次最多喂 3 秒（16k）。命令词最长 6 个字（约 1.5 秒），3 秒足够且不会截断。
-constexpr size_t kMaxFeedSamples = 16000 * 3;
+constexpr size_t kMaxFeedSamples = 16000 * 2;       // 2 秒：命令词约 1.2~1.5 秒，留足余量
 
 const esp_mn_iface_t* s_mn = nullptr;
 model_iface_data_t* s_data = nullptr;
@@ -158,7 +158,7 @@ bool local_asr_recognize(const int16_t* pcm, size_t samples, std::string* out_cm
         }
     }
     if (samples > kMaxFeedSamples) {
-        samples = kMaxFeedSamples;   // 最多 3 秒
+        samples = kMaxFeedSamples;   // 最多 2 秒（尾部静音另外补喂，不计入）
     }
 
     s_mn->clean(s_data);

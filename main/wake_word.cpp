@@ -56,7 +56,7 @@ int64_t s_pause_since_us = 0;
 // 跨任务读写用原子操作，避免数据竞争，也避开 volatile 自增的编译告警
 inline int pause_cnt_get() { return __atomic_load_n(&s_listen_pause_cnt, __ATOMIC_ACQUIRE); }
 inline void pause_cnt_set(int v) { __atomic_store_n(&s_listen_pause_cnt, v, __ATOMIC_RELEASE); }
-constexpr int64_t kPauseTimeoutUs = 5LL * 1000 * 1000;
+constexpr int64_t kPauseTimeoutUs = 12LL * 1000 * 1000;   // 一句话播报可能 4~6 秒，留足余量
 
 const int16_t* s_afe_pcm = nullptr;   // 最近一次录音的 AFE 输出（给离线命令词）
 size_t s_afe_pcm_len = 0;
@@ -439,12 +439,15 @@ void WakeWord::run()
                     if (noise_pk < 800) noise_pk = 800;
                     if (pk > dbg_pk_max) dbg_pk_max = pk;
 
-                    // 说话阈值：正常要明显高于底噪；音乐窗口要更高（避免喇叭声自激）
+                    // 说话阈值：正常要明显高于底噪。
+                    // 音乐窗口：音乐播放时会 ducking 到 20%，实测漏音峰值只有 ~1000，
+                    // 而人声峰值 ~4000（AFE 的 AGC 会把整体电平压低），
+                    // 所以阈值取 max(底噪*3, 3000) 即可，不必像以前那样硬编码 8000。
                     const int speech_pk_thresh = music_window_
-                                                     ? 8000
-                                                     : ((noise_pk * 3 > 2500) ? (noise_pk * 3) : 2500);
+                                                     ? ((noise_pk * 3 > 3500) ? (noise_pk * 3) : 3500)
+                                                     : ((noise_pk * 3 > 2200) ? (noise_pk * 3) : 2200);
                     const int quiet_pk_thresh = music_window_
-                                                    ? 4000
+                                                    ? ((noise_pk * 2 > 1800) ? (noise_pk * 2) : 1800)
                                                     : ((noise_pk * 2 > 2000) ? (noise_pk * 2) : 2000);
 
                     if (total_chunks > 20) {
@@ -469,9 +472,19 @@ void WakeWord::run()
                                 speech_seen = true;
                             }
                         } else {
-                            speech_chunks = 0;
-                            if (speech_seen && pk < quiet_pk_thresh) {
-                                ++quiet_chunks;
+                            if (!speech_seen) {
+                                // ★ 字与字之间会自然掉音，这里只衰减不清零，
+                                //   否则语速正常的一句话永远凑不满"连续 N 块"，
+                                //   实测表现为"说了没反应，要说好几遍才触发"。
+                                speech_chunks -= 2;
+                                if (speech_chunks < 0) {
+                                    speech_chunks = 0;
+                                }
+                            } else {
+                                speech_chunks = 0;
+                                if (pk < quiet_pk_thresh) {
+                                    ++quiet_chunks;
+                                }
                             }
                         }
                     }
@@ -579,7 +592,7 @@ void WakeWord::run()
                             recording = true;
                             enabled_ = true;            // 音乐窗口里也允许说唤醒词
                             noise_pk = 1200;
-                            audio_hub_set_music_volume(20);   // 只压低音乐（TTS/提示音不受影响）
+                            audio_hub_set_music_volume(CONFIG_AMYAI_MUSIC_DUCK_PERCENT);   // 只压低音乐（TTS/提示音不受影响）
                         } else if (cancel_follow_up_) {
                             cancel_follow_up_ = false;
                             recording = false;
@@ -619,7 +632,7 @@ void WakeWord::run()
                     // 暂停超时自恢复：防止提示音任务异常导致设备永久"失聪"
                     if (pause_cnt_get() > 0 &&
                         esp_timer_get_time() - s_pause_since_us > kPauseTimeoutUs) {
-                        ESP_LOGE(kTag, "提示音暂停超过 5 秒未解除，强制恢复录音");
+                        ESP_LOGE(kTag, "播报暂停超过 12 秒未解除，强制恢复录音");
                         pause_cnt_set(0);
                     }
                     if (recording) {
@@ -743,7 +756,7 @@ void WakeWord::run()
                 speech_chunks = 0;
                 noise_pk = 1200;
                 enabled_ = true;            // 音乐窗口里也允许说唤醒词
-                audio_hub_set_music_volume(20);
+                audio_hub_set_music_volume(CONFIG_AMYAI_MUSIC_DUCK_PERCENT);
                 ESP_LOGI(kTag, "音乐窗口：开始监听短指令（音乐压低到 20%%，否则识别不出人声）");
             }
 

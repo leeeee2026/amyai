@@ -44,16 +44,17 @@ constexpr int kKeepAliveCount    = 3;
 
 const char* kSystemPrompt = R"PROMPT(你是按摩椅语音助手。只输出一行 JSON，不要解释、不要 Markdown。
 reply 永远是第一个字段（系统要边生成边播报）。
+reply 里不要出现英文单引号或双引号，需要引号时用中文「」。
 
 【意图】
 控制按摩椅 -> {"reply":"确认语","intent":"control","cmd":...}（多动作用 "actions":[...]）
 闲聊问答 -> {"reply":"...","intent":"chat"}（不超过25字，口语，不反问）
 问你能做什么 -> {"reply":"...","intent":"intro"}
-想听音乐 -> {"reply":"...","intent":"music","action":"play|stop|next","query":"..."}
+用户明确要音乐/歌/曲时才用（没提音乐的一律 chat/unknown） -> {"reply":"","intent":"music","action":"play|stop|next","query":"..."}（music 的 reply 必须为空字符串，直接执行不播报）
 不懂/无关 -> {"reply":"...","intent":"unknown"}
 
 【控制指令】
-start/stop/pause/resume
+start/stop/pause/resume（这四个起停指令的 reply 必须是空字符串 ""，直接执行不播报）
 set_zone zones:["neck","shoulder","back","waist","hip","leg","foot","arm","full"]
 set_intensity level:1-5        adjust_intensity delta:-2..2（可带 zones）
 set_speed level:1-5            adjust_speed delta:-2..2
@@ -87,7 +88,7 @@ query_status（状态查询输出 {"intent":"control","cmd":"query_status"}）
 "你好" -> {"reply":"你好呀，我在呢。","intent":"chat"}
 "今天天气怎么样" -> {"reply":"我现在还查不到实时天气。","intent":"chat"}
 "你能干什么" -> {"reply":"我能帮你按按摩、调力度、开热敷。","intent":"intro"}
-"来点雨声" -> {"reply":"给你放点雨声。","intent":"music","action":"play","query":"雨声"}
+"来点雨声" -> {"reply":"","intent":"music","action":"play","query":"雨声"}
 "帮我订机票" -> {"reply":"这个我还做不了。","intent":"unknown"}
 )PROMPT";
 
@@ -111,6 +112,9 @@ struct StreamCtx {
     bool done = false;
     const std::function<void(const std::string&)>* cb = nullptr;
 };
+
+// 当前正在进行的流式请求上下文（复用连接时 user_data 固定为 nullptr，靠它传递）
+StreamCtx* s_cur_stream = nullptr;
 
 void emit_reply_delta(StreamCtx* ctx)
 {
@@ -165,6 +169,9 @@ esp_err_t stream_event(esp_http_client_event_t* evt)
         return ESP_OK;
     }
     auto* ctx = static_cast<StreamCtx*>(evt->user_data);
+    if (ctx == nullptr) {
+        ctx = s_cur_stream;   // 流式连接复用：user_data 固定为 nullptr
+    }
     if (ctx == nullptr || evt->data == nullptr || evt->data_len <= 0) {
         return ESP_OK;
     }
@@ -242,8 +249,6 @@ void drop_stream_client()
         s_stream_client = nullptr;
     }
 }
-
-StreamCtx* s_cur_stream = nullptr;
 
 // 把最近一轮对话写进历史（和 ask_llm 的行为保持一致）
 void push_history(const std::string& user_text, const std::string& reply)
@@ -404,7 +409,7 @@ std::string ask_llm(const std::string& user_text)
 
     // ★ 聊天需要一点变化，否则同一句话永远得到同一个回答（但 0.7 实测控制指令仍稳定）
     cJSON_AddNumberToObject(root, "temperature", 0.7);
-    cJSON_AddNumberToObject(root, "max_tokens", 64);
+    cJSON_AddNumberToObject(root, "max_tokens", 220);   // 太小会把回复截断成非法 JSON
 
     char* body = cJSON_PrintUnformatted(root);
     cJSON_Delete(root);
@@ -527,7 +532,7 @@ std::string ask_llm_stream(const std::string& user_text,
     cJSON_AddItemToArray(messages, user_msg);
 
     cJSON_AddNumberToObject(root, "temperature", 0.7);
-    cJSON_AddNumberToObject(root, "max_tokens", 64);
+    cJSON_AddNumberToObject(root, "max_tokens", 220);   // 太小会把回复截断成非法 JSON
     cJSON_AddBoolToObject(root, "stream", true);
 
     char* body = cJSON_PrintUnformatted(root);

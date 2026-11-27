@@ -15,6 +15,9 @@
 // 这句话看起来是不是"按摩控制类"（部位/力度/角度/热敷/速度/时间/起停/手法）
 bool local_is_control(const std::string& text);
 
+// 音乐窗口专用：判断这句话像不像音乐操作指令（换歌/放歌等），其余一律忽略
+bool local_is_music_command(const std::string& text);
+
 // 是不是"停止音乐"的指令。
 // 判定从严：必须是短句（<=10 字）且明确含停止词，避免把闲聊误判成停止。
 bool local_is_stop_command(const std::string& text);

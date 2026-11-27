@@ -20,6 +20,7 @@
 #include "esp_log.h"
 #include "esp_netif.h"
 #include "esp_system.h"
+#include "esp_heap_caps.h"
 #include "esp_timer.h"
 #include "esp_wifi.h"
 #include "nvs_flash.h"
@@ -31,6 +32,7 @@
 
 #include "cJSON.h"
 #include "asr_client.h"
+#include "diag.h"
 #include "llm_client.h"
 #include "reply_player.h"
 #include "tts_client.h"
@@ -47,22 +49,6 @@ constexpr const char* kTag = "amyai";
 
 // 本轮录音是不是用户主动喊唤醒词触发的（用来区分"音乐窗口自动监听"）
 static bool g_from_wake = false;
-
-// ASR 偶尔会把音乐/噪声识别成 "#"、"嗯"、"啊" 之类的碎片，这种不能当指令
-bool text_is_garbage(const std::string& t)
-{
-    int cjk = 0;
-    int alnum = 0;
-    for (unsigned char ch : t) {
-        if (ch >= 0xE4 && ch <= 0xE9) {
-            ++cjk;                     // 中文字符的 UTF-8 首字节大致范围
-        } else if ((ch >= '0' && ch <= '9') || (ch >= 'a' && ch <= 'z') ||
-                   (ch >= 'A' && ch <= 'Z')) {
-            ++alnum;
-        }
-    }
-    return (cjk < 2 && alnum < 3);
-}
 
 // 网络是否已就绪（连上 WiFi 且拿到 IP 后才允许语音交互）
 static volatile bool g_net_ready = false;
@@ -675,23 +661,26 @@ extern "C" void app_main(void)
             } follow_guard{from_music, &wake};
 
             if (from_music) {
-                // 停止类指令优先判断（"停"只有一个字，不能走乱码过滤）
+                // ★ 音乐窗口只处理两种事，其余一律忽略、不走云端：
+                //   1) 停止类：直接停，静默
+                //   2) 换歌类：直接换，静默
+                //   音乐声被 ASR 识别出的碎片（"听不清"、""#" 等）太多，
+                //   一旦送去云端就会冒出莫名其妙的回复，甚至误判成"放歌"。
                 if (local_is_stop_command(text)) {
-                    ESP_LOGI(kTag, "【音乐窗口】停止指令「%s」", text.c_str());
+                    ESP_LOGI(kTag, "【音乐窗口】停止「%s」", text.c_str());
                     music_stop();
                     wake.set_music_window(false);
-                    tts_speak("停了。");
                     return;   // 返回时 guard 会自动开启连续聆听
                 }
-                // 音乐声触发的识别结果常是 "#" 之类的碎片，忽略掉继续放音乐
-                if (text_is_garbage(text)) {
-                    ESP_LOGI(kTag, "【音乐窗口】识别乱码「%s」，忽略（音乐继续）", text.c_str());
-                    return;
+                if (local_is_music_command(text)) {
+                    ESP_LOGI(kTag, "【音乐窗口】换歌「%s」", text.c_str());
+                    if (music_next()) {
+                        ESP_LOGI(kTag, "【音乐】换到：%s", music_current());
+                    }
+                    return;   // 保持音乐窗口，继续听
                 }
-                ESP_LOGI(kTag, "【音乐窗口】收到「%s」，先停音乐", text.c_str());
-                music_stop();
-                wake.set_music_window(false);
-                // 其他指令继续往下走完整流程
+                ESP_LOGI(kTag, "【音乐窗口】「%s」忽略（不是停止/换歌指令，音乐继续）", text.c_str());
+                return;
             }
 
             // 主动唤醒且音乐在放：先把音乐停掉，把喇叭让给 TTS
@@ -715,11 +704,20 @@ extern "C" void app_main(void)
 
             // 3. 文字 -> 带意图的 JSON（★ 流式：边生成边播报 reply）
             const int64_t t_llm0 = esp_timer_get_time();
+            int64_t t_first_delta_us = 0;
             reply_player_begin();
-            const std::string reply = ask_llm_stream(text, [](const std::string& delta) {
-                reply_player_feed(delta);   // 切句 + 抖动缓冲 + 送 TTS
-            });
-            const int64_t t_llm_begin = (esp_timer_get_time() - t_llm0) / 1000;
+            const std::string reply = ask_llm_stream(
+                text, [&t_first_delta_us](const std::string& delta) {
+                    if (t_first_delta_us == 0) {
+                        t_first_delta_us = esp_timer_get_time();   // 第一段文字到达时间
+                    }
+                    reply_player_feed(delta);   // 切句 + 抖动缓冲 + 送 TTS
+                });
+            // 首字延迟：从发起请求到第一段文字到达（这才是流式的收益点）
+            // 如果没有回调过，说明一次就返回了整段（模型很快或没走流式）
+            const int64_t t_llm_begin = (t_first_delta_us > 0)
+                                            ? (t_first_delta_us - t_llm0) / 1000
+                                            : -1;
             reply_player_finish();
             const int64_t t_llm = (esp_timer_get_time() - t_llm0) / 1000;
             ESP_LOGI(kTag, "[耗时] ASR=%lld ms, LLM首字=%lld ms, LLM收完=%lld ms, 录音结束→LLM完成=%lld ms",
@@ -735,7 +733,25 @@ extern "C" void app_main(void)
             ESP_LOGI(kTag, "模型返回: %s", reply.c_str());
 
             // 3. 按意图分流
-            cJSON* root = cJSON_Parse(reply.c_str());
+            // ★ 模型偶尔会输出 \' （JSON 里非法的转义，多见于讲笑话时引用对话），
+            //   先清洗掉，否则整条回复解析失败。
+            std::string json_sane = reply;
+            {
+                size_t p = 0;
+                while ((p = json_sane.find("\\'", p)) != std::string::npos) {
+                    json_sane.replace(p, 2, "'");
+                    ++p;
+                }
+            }
+            cJSON* root = cJSON_Parse(json_sane.c_str());
+            if (root == nullptr) {
+                // JSON 不合法（最常见原因：回复太长被 max_tokens 截断）。
+                // reply 字段的内容已经流式播报过了，这里不要再播兜底语（会打断播报），
+                // 也不要下发指令（避免误动作）。
+                ESP_LOGW(kTag, "模型返回不是合法 JSON（可能被 max_tokens 截断），保留已播报内容");
+                reply_player_wait_done(20000);
+                return;
+            }
             cJSON* intent_item = cJSON_GetObjectItem(root, "intent");
             const char* intent = cJSON_IsString(intent_item) ? intent_item->valuestring : "control";
 
@@ -753,6 +769,9 @@ extern "C" void app_main(void)
                     tts_speak(kIntroText);
                 }
             } else if (std::strcmp(intent, "music") == 0) {
+                // ★ 必须等回复播完再动音乐：流式播报还在响的时候开播，
+                //   TTS（高优先级）会抢占音频通道，音乐任务 write 失败会直接退出。
+                reply_player_wait_done(15000);
                 cJSON* act = cJSON_GetObjectItem(root, "action");
                 cJSON* q = cJSON_GetObjectItem(root, "query");
                 const char* action = cJSON_IsString(act) ? act->valuestring : "play";
@@ -760,8 +779,7 @@ extern "C" void app_main(void)
                     if (music_is_playing()) {
                         music_stop();
                         wake.set_music_window(false);
-                        ESP_LOGI(kTag, "【音乐】已停止");
-                        tts_speak("停了。");
+                        ESP_LOGI(kTag, "【音乐】已停止");   // 停下就好，不播报（用户要求静默）
                     } else {
                         tts_speak("现在没在放音乐。");
                     }
@@ -837,13 +855,19 @@ extern "C" void app_main(void)
             }
             vTaskDelete(nullptr);
         },
-        "asr_init", 10 * 1024, nullptr, 2, nullptr);
+        "asr_init", 8 * 1024, nullptr, 2, nullptr);
 
     if (wake_ok) {
         ESP_LOGI(kTag, "等待唤醒词: \"%s\"", CONFIG_AMYAI_WAKE_TEXT);
     } else {
         ESP_LOGW(kTag, "唤醒功能未启动（多半是 I2S 引脚没配置），继续跑联网部分");
     }
+
+    // 开机内存快照：内部 RAM 是本板最紧张的资源（WiFi + TLS 都从这里要）
+    AMYAI_DIAGI(kTag, "[内存] 连网前：内部 %u 空闲（最大块 %u）| PSRAM %u 空闲",
+                static_cast<unsigned>(heap_caps_get_free_size(MALLOC_CAP_INTERNAL)),
+                static_cast<unsigned>(heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL)),
+                static_cast<unsigned>(heap_caps_get_free_size(MALLOC_CAP_SPIRAM)));
 
     static WifiStation sta;
     if (sta.init() != ESP_OK) {

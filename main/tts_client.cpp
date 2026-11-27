@@ -1,4 +1,5 @@
 #include "tts_client.h"
+#include "wake_word.h"
 
 #include <algorithm>
 #include <cstring>
@@ -361,6 +362,9 @@ void handle_sse_data(SseCtx* ctx, const char* json)
 esp_err_t sse_event(esp_http_client_event_t* evt)
 {
     auto* ctx = static_cast<SseCtx*>(evt->user_data);
+    if (ctx == nullptr) {
+        ctx = s_cur_ctx;   // 复用连接时 user_data 固定为 nullptr，用当前请求的 ctx
+    }
     if (evt->event_id != HTTP_EVENT_ON_DATA || ctx == nullptr || ctx->error) {
         return ESP_OK;
     }
@@ -548,6 +552,13 @@ bool tts_speak(const std::string& text)
 {
     if (text.empty()) return false;
     set_error("");
+
+    // ★ 播报期间暂停录音：否则麦克风会把喇叭声录进去，ASR 认出"自己说的话"
+    //   当成新的用户输入 —— 实测会出现"它把自己讲的段子当成用户在问"的自激。
+    wake_pause_listening(true);
+    struct PauseGuard {
+        ~PauseGuard() { wake_pause_listening(false); }
+    } pause_guard;
 
     size_t total_chars = 0;
     for (size_t i = 0; i < text.size(); ++i) {

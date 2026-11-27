@@ -10,6 +10,7 @@
 #include "freertos/queue.h"
 #include "freertos/semphr.h"
 #include "freertos/task.h"
+#include "freertos/idf_additions.h"
 #include "tts_client.h"
 
 namespace {
@@ -25,6 +26,7 @@ constexpr size_t kMaxSentenceChars = 22;
 QueueHandle_t s_queue = nullptr;        // 待播句子（char*）
 SemaphoreHandle_t s_lock = nullptr;     // 保护下面的状态
 SemaphoreHandle_t s_done = nullptr;     // 本轮播完
+bool s_done_flag = false;               // 本轮是否已经播完（让 wait_done 幂等）
 
 std::string s_text;                     // 还没切出完整句子的残留文本
 std::vector<std::string> s_pending;     // 已切好、还没送进队列的句子
@@ -160,6 +162,7 @@ void consumer_task(void*)
         }
         if (item == nullptr) {
             // 结束标记：本轮播完
+            s_done_flag = true;
             xSemaphoreGive(s_done);
             continue;
         }
@@ -182,7 +185,10 @@ bool reply_player_init()
         ESP_LOGE(kTag, "流式播放器初始化失败（内存不足）");
         return false;
     }
-    if (xTaskCreate(consumer_task, "reply_play", 6144, nullptr, 4, nullptr) != pdPASS) {
+    // ★ 任务栈放 PSRAM：这个任务要跑 TTS 的 TLS 请求，需要 ~12KB 栈，
+    //   放内部 RAM 会把堆挤爆（实测导致 lwip 分配信号量失败、DNS 直接崩）。
+    if (xTaskCreateWithCaps(consumer_task, "reply_play", 12 * 1024, nullptr, 4,
+                            nullptr, MALLOC_CAP_SPIRAM) != pdPASS) {
         ESP_LOGE(kTag, "播放任务创建失败");
         return false;
     }
@@ -208,6 +214,7 @@ void reply_player_begin()
         }
     }
     xSemaphoreGive(s_lock);
+    s_done_flag = false;
     xSemaphoreTake(s_done, 0);   // 清掉旧的完成信号
 }
 
@@ -259,7 +266,16 @@ bool reply_player_wait_done(int timeout_ms)
     if (s_done == nullptr) {
         return true;
     }
-    return xSemaphoreTake(s_done, pdMS_TO_TICKS(timeout_ms)) == pdTRUE;
+    // 幂等：本轮已经播完的话直接返回。
+    // 否则第二次调用会等满整个超时（音乐分支和回调结尾各调一次，实测卡 20 秒）。
+    if (s_done_flag) {
+        return true;
+    }
+    if (xSemaphoreTake(s_done, pdMS_TO_TICKS(timeout_ms)) == pdTRUE) {
+        s_done_flag = true;
+        return true;
+    }
+    return false;
 }
 
 bool reply_player_spoke_anything()
