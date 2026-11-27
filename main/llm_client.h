@@ -1,11 +1,16 @@
 #pragma once
 
+#include <functional>
 #include <string>
 
-// 把用户说的话发给大模型，返回模型输出的指令文本（通常是 JSON 字符串）。
-// 失败（未配置 Key / 网络错误 / 解析失败）返回空字符串。
-// 内部会自动记录最近 3 轮对话作为上下文。
+// 问大模型：返回模型输出的 JSON 字符串（失败返回空串）
 std::string ask_llm(const std::string& user_text);
 
-// 清空对话上下文（重新唤醒时调用，开始一段新会话）
+// 流式问大模型：边收边回调 reply 字段的增量文本。
+// on_delta 收到的是 reply 字段里新增的那一段（已去 JSON 转义，可直接送 TTS）。
+// 返回值仍然是完整 JSON（用来解析 intent/cmd），失败返回空串。
+std::string ask_llm_stream(const std::string& user_text,
+                           const std::function<void(const std::string&)>& on_delta);
+
+// 清空多轮对话上下文
 void llm_reset_history();

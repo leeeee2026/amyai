@@ -32,6 +32,7 @@
 #include "cJSON.h"
 #include "asr_client.h"
 #include "llm_client.h"
+#include "reply_player.h"
 #include "tts_client.h"
 #include "local_cue.h"
 #include "local_asr.h"
@@ -593,7 +594,8 @@ extern "C" void app_main(void)
         ESP_LOGW(kTag, "主控通信未启用，指令只会打印到日志");
     }
 
-    tts_init();   // 语音合成（聊天/播报用）
+    tts_init();
+    reply_player_init();   // 流式回复播放器（边生成边播报）
 
     // 唤醒词：不依赖 Wi-Fi，先启动。引脚没配好时只报警告，不影响后面的联网流程。
     static WakeWord wake;
@@ -711,15 +713,22 @@ extern "C" void app_main(void)
                 local_play_ack();
             }
 
-            // 3. 文字 -> 带意图的 JSON（照常走云端，拿到完整回复）
+            // 3. 文字 -> 带意图的 JSON（★ 流式：边生成边播报 reply）
             const int64_t t_llm0 = esp_timer_get_time();
-            const std::string reply = ask_llm(text);
+            reply_player_begin();
+            const std::string reply = ask_llm_stream(text, [](const std::string& delta) {
+                reply_player_feed(delta);   // 切句 + 抖动缓冲 + 送 TTS
+            });
+            const int64_t t_llm_begin = (esp_timer_get_time() - t_llm0) / 1000;
+            reply_player_finish();
             const int64_t t_llm = (esp_timer_get_time() - t_llm0) / 1000;
-            ESP_LOGI(kTag, "[耗时] ASR=%lld ms, LLM=%lld ms, 录音结束→LLM完成=%lld ms",
-                     static_cast<long long>(t_asr), static_cast<long long>(t_llm),
+            ESP_LOGI(kTag, "[耗时] ASR=%lld ms, LLM首字=%lld ms, LLM收完=%lld ms, 录音结束→LLM完成=%lld ms",
+                     static_cast<long long>(t_asr), static_cast<long long>(t_llm_begin),
+                     static_cast<long long>(t_llm),
                      static_cast<long long>((esp_timer_get_time() - t_cb0) / 1000));
             if (reply.empty()) {
-                ESP_LOGE(kTag, "大模型调用失败");
+                ESP_LOGE(kTag, "大模型调用失败（流式）");
+                reply_player_wait_done(3000);
                 tts_speak("网络不太好。");
                 return;
             }
@@ -733,15 +742,16 @@ extern "C" void app_main(void)
             if (std::strcmp(intent, "chat") == 0) {
                 cJSON* r = cJSON_GetObjectItem(root, "reply");
                 if (cJSON_IsString(r) && r->valuestring[0] != '\0') {
-                    ESP_LOGI(kTag, "【聊天】%s", r->valuestring);
-                    tts_speak(r->valuestring);
+                    ESP_LOGI(kTag, "【聊天】%s", r->valuestring);   // 已在流式阶段播过
                 } else {
                     ESP_LOGW(kTag, "chat 意图但没给 reply");
                     tts_speak("这个我还没想好。");
                 }
             } else if (std::strcmp(intent, "intro") == 0) {
                 ESP_LOGI(kTag, "【产品介绍】");
-                tts_speak(kIntroText);
+                if (!reply_player_spoke_anything()) {
+                    tts_speak(kIntroText);
+                }
             } else if (std::strcmp(intent, "music") == 0) {
                 cJSON* act = cJSON_GetObjectItem(root, "action");
                 cJSON* q = cJSON_GetObjectItem(root, "query");
@@ -772,7 +782,9 @@ extern "C" void app_main(void)
                 }
             } else if (std::strcmp(intent, "unknown") == 0) {
                 ESP_LOGW(kTag, "【未知】");
-                tts_speak("没听懂，你再说一次。");
+                if (!reply_player_spoke_anything()) {
+                    tts_speak("没听懂，你再说一次。");
+                }
             } else {
                 // control（或老格式没有 intent 字段）
                 if (!validate_command(reply)) {
@@ -796,11 +808,10 @@ extern "C" void app_main(void)
                     if (uart_link_send_command(cmd_payload)) {
                         ESP_LOGI(kTag, "指令已送达主控");
 #if CONFIG_AMYAI_TTS_CONFIRM
-                        // 主控确认后再播报，确保"说的话"和"执行的事"一致
+                        // 确认语已经在流式阶段播过了，这里只打个日志
                         cJSON* ack_text = cJSON_GetObjectItem(root, "reply");
                         if (cJSON_IsString(ack_text) && ack_text->valuestring[0] != '\0') {
                             ESP_LOGI(kTag, "【确认】%s", ack_text->valuestring);
-                            tts_speak(ack_text->valuestring);
                         }
 #endif
                     } else {
@@ -810,6 +821,8 @@ extern "C" void app_main(void)
                 }
             }
             cJSON_Delete(root);
+            // 等流式播报播完，再回去继续聆听
+            reply_player_wait_done(20000);
         });
     // ★ 离线命令词识别（MultiNet）：放到独立任务里延迟初始化。
     //   原因：MultiNet 加载模型要 1.5~2 秒，如果放在唤醒监听启动的同一个上下文里跑，

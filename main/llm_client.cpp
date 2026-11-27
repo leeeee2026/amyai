@@ -43,13 +43,14 @@ constexpr int kKeepAliveInterval = 30;
 constexpr int kKeepAliveCount    = 3;
 
 const char* kSystemPrompt = R"PROMPT(你是按摩椅语音助手。只输出一行 JSON，不要解释、不要 Markdown。
+reply 永远是第一个字段（系统要边生成边播报）。
 
 【意图】
-控制按摩椅 -> {"intent":"control","cmd":...,"reply":"确认语"}（多动作用 "actions":[...]）
-闲聊问答 -> {"intent":"chat","reply":"..."}（不超过25字，口语，不反问）
-问你能做什么 -> {"intent":"intro"}
-想听音乐 -> {"intent":"music","action":"play|stop|next","query":"..."}
-不懂/无关 -> {"intent":"unknown"}
+控制按摩椅 -> {"reply":"确认语","intent":"control","cmd":...}（多动作用 "actions":[...]）
+闲聊问答 -> {"reply":"...","intent":"chat"}（不超过25字，口语，不反问）
+问你能做什么 -> {"reply":"...","intent":"intro"}
+想听音乐 -> {"reply":"...","intent":"music","action":"play|stop|next","query":"..."}
+不懂/无关 -> {"reply":"...","intent":"unknown"}
 
 【控制指令】
 start/stop/pause/resume
@@ -75,19 +76,19 @@ query_status（状态查询输出 {"intent":"control","cmd":"query_status"}）
 - "放松一下/放松模式/来点放松的"用 set_program program:relax
 
 【示例】
-"脖子好酸" -> {"intent":"control","cmd":"set_zone","zones":["neck"],"reply":"好的，按脖子"}
-"重一点" -> {"intent":"control","cmd":"adjust_intensity","delta":1,"reply":"调重了一点"}
-"太疼了" -> {"intent":"control","cmd":"adjust_intensity","delta":-2,"reply":"已经调轻了"}
-"腿抬高一点" -> {"intent":"control","cmd":"adjust_leg_rest","delta":10,"reply":"腿托抬高一点"}
-"腿按重一点" -> {"intent":"control","cmd":"adjust_intensity","delta":1,"zones":["leg"],"reply":"腿的力度调重了"}
-"靠背放倒一点" -> {"intent":"control","cmd":"adjust_recline","delta":-10,"reply":"靠背放低了"}
-"放松一下" -> {"intent":"control","cmd":"set_program","program":"relax","reply":"给你来个放松模式"}
-"来个零重力" -> {"intent":"control","cmd":"set_zero_gravity","on":true,"reply":"零重力开启"}
-"你好" -> {"intent":"chat","reply":"你好呀，我在呢。"}
-"今天天气怎么样" -> {"intent":"chat","reply":"我现在还查不到实时天气。"}
-"你能干什么" -> {"intent":"intro"}
-"来点雨声" -> {"intent":"music","action":"play","query":"雨声"}
-"帮我订机票" -> {"intent":"unknown"}
+"脖子好酸" -> {"reply":"好的，按脖子","intent":"control","cmd":"set_zone","zones":["neck"]}
+"重一点" -> {"reply":"调重了一点","intent":"control","cmd":"adjust_intensity","delta":1}
+"太疼了" -> {"reply":"已经调轻了","intent":"control","cmd":"adjust_intensity","delta":-2}
+"腿抬高一点" -> {"reply":"腿托抬高一点","intent":"control","cmd":"adjust_leg_rest","delta":10}
+"腿按重一点" -> {"reply":"腿的力度调重了","intent":"control","cmd":"adjust_intensity","delta":1,"zones":["leg"]}
+"靠背放倒一点" -> {"reply":"靠背放低了","intent":"control","cmd":"adjust_recline","delta":-10}
+"放松一下" -> {"reply":"给你来个放松模式","intent":"control","cmd":"set_program","program":"relax"}
+"来个零重力" -> {"reply":"零重力开启","intent":"control","cmd":"set_zero_gravity","on":true}
+"你好" -> {"reply":"你好呀，我在呢。","intent":"chat"}
+"今天天气怎么样" -> {"reply":"我现在还查不到实时天气。","intent":"chat"}
+"你能干什么" -> {"reply":"我能帮你按按摩、调力度、开热敷。","intent":"intro"}
+"来点雨声" -> {"reply":"给你放点雨声。","intent":"music","action":"play","query":"雨声"}
+"帮我订机票" -> {"reply":"这个我还做不了。","intent":"unknown"}
 )PROMPT";
 
 // 常驻状态：响应缓冲和复用的连接句柄
@@ -96,6 +97,172 @@ esp_http_client_handle_t g_client = nullptr;
 SemaphoreHandle_t g_lock = nullptr;   // 防止多任务同时调用大模型
 
 // 收集响应正文
+
+// ---------------------------------------------------------------- 流式（SSE）
+// 逐块解析智谱的 SSE 响应：data: {"choices":[{"delta":{"content":"..."}}]}
+// 从累积内容里边解析 "reply" 字段边回调，TTS 就能边生成边播。
+
+struct StreamCtx {
+    std::string sse_buf;        // SSE 行缓冲
+    std::string content;        // 累积的 delta.content（即模型输出的 JSON 文本）
+    size_t reply_begin = 0;     // "reply":" 之后的位置
+    size_t emitted = 0;         // 已经回调出去的字符数
+    bool reply_started = false;
+    bool done = false;
+    const std::function<void(const std::string&)>* cb = nullptr;
+};
+
+void emit_reply_delta(StreamCtx* ctx)
+{
+    if (!ctx->reply_started) {
+        const std::string key = "\"reply\":\"";
+        const size_t p = ctx->content.find(key);
+        if (p == std::string::npos) {
+            return;
+        }
+        ctx->reply_started = true;
+        ctx->reply_begin = p + key.size();
+        ctx->emitted = 0;
+    }
+
+    std::string decoded;
+    size_t i = ctx->reply_begin;
+    while (i < ctx->content.size()) {
+        const char c = ctx->content[i];
+        if (c == '\\' && i + 1 < ctx->content.size()) {
+            const char n = ctx->content[i + 1];
+            switch (n) {
+            case '"':  decoded += '"';  break;
+            case '\\': decoded += '\\'; break;
+            case 'n':  decoded += '\n'; break;
+            case 't':  decoded += '\t'; break;
+            case 'r':  decoded += '\r'; break;
+            case 'u':  i += 6; continue;      // \uXXXX 极少见，跳过
+            default:   decoded += n;    break;
+            }
+            i += 2;
+            continue;
+        }
+        if (c == '"') {
+            break;                             // reply 结束
+        }
+        decoded += c;
+        ++i;
+    }
+
+    if (decoded.size() > ctx->emitted) {
+        const std::string delta = decoded.substr(ctx->emitted);
+        ctx->emitted = decoded.size();
+        if (ctx->cb != nullptr && *ctx->cb) {
+            (*ctx->cb)(delta);
+        }
+    }
+}
+
+esp_err_t stream_event(esp_http_client_event_t* evt)
+{
+    if (evt->event_id != HTTP_EVENT_ON_DATA) {
+        return ESP_OK;
+    }
+    auto* ctx = static_cast<StreamCtx*>(evt->user_data);
+    if (ctx == nullptr || evt->data == nullptr || evt->data_len <= 0) {
+        return ESP_OK;
+    }
+    ctx->sse_buf.append(static_cast<const char*>(evt->data),
+                        static_cast<size_t>(evt->data_len));
+
+    size_t nl = 0;
+    while ((nl = ctx->sse_buf.find('\n')) != std::string::npos) {
+        std::string line = ctx->sse_buf.substr(0, nl);
+        ctx->sse_buf.erase(0, nl + 1);
+        if (!line.empty() && line.back() == '\r') {
+            line.pop_back();
+        }
+        if (line.rfind("data: ", 0) != 0) {
+            continue;
+        }
+        const std::string payload = line.substr(6);
+        if (payload == "[DONE]") {
+            ctx->done = true;
+            continue;
+        }
+        cJSON* root = cJSON_Parse(payload.c_str());
+        if (root == nullptr) {
+            continue;
+        }
+        cJSON* ch = cJSON_GetObjectItem(root, "choices");
+        cJSON* f  = cJSON_GetArrayItem(ch, 0);
+        cJSON* d  = cJSON_GetObjectItem(f, "delta");
+        cJSON* c  = cJSON_GetObjectItem(d, "content");
+        if (cJSON_IsString(c) && c->valuestring != nullptr) {
+            ctx->content += c->valuestring;
+            emit_reply_delta(ctx);
+        }
+        cJSON_Delete(root);
+    }
+    return ESP_OK;
+}
+
+// 流式请求专用连接（和普通请求分开，事件回调不一样）
+esp_http_client_handle_t s_stream_client = nullptr;
+
+esp_http_client_handle_t ensure_stream_client(const std::string& auth)
+{
+    if (s_stream_client != nullptr) {
+        esp_http_client_set_header(s_stream_client, "Authorization", auth.c_str());
+        return s_stream_client;
+    }
+    esp_http_client_config_t cfg = {};
+    cfg.url               = kUrl;
+    cfg.method            = HTTP_METHOD_POST;
+    cfg.event_handler     = stream_event;
+    cfg.user_data         = nullptr;      // 每次请求通过全局 s_stream_ctx 指定
+    cfg.crt_bundle_attach = esp_crt_bundle_attach;
+    cfg.timeout_ms        = kTimeoutMs;
+    cfg.buffer_size       = 1024;         // SSE 小块流式，缓冲小一点更及时
+    cfg.keep_alive_enable   = true;
+    cfg.keep_alive_idle     = kKeepAliveIdle;
+    cfg.keep_alive_interval = kKeepAliveInterval;
+    cfg.keep_alive_count    = kKeepAliveCount;
+
+    s_stream_client = esp_http_client_init(&cfg);
+    if (s_stream_client == nullptr) {
+        return nullptr;
+    }
+    esp_http_client_set_header(s_stream_client, "Content-Type", "application/json");
+    esp_http_client_set_header(s_stream_client, "Accept", "text/event-stream");
+    esp_http_client_set_header(s_stream_client, "Authorization", auth.c_str());
+    return s_stream_client;
+}
+
+void drop_stream_client()
+{
+    if (s_stream_client != nullptr) {
+        esp_http_client_cleanup(s_stream_client);
+        s_stream_client = nullptr;
+    }
+}
+
+StreamCtx* s_cur_stream = nullptr;
+
+// 把最近一轮对话写进历史（和 ask_llm 的行为保持一致）
+void push_history(const std::string& user_text, const std::string& reply)
+{
+    if (reply.empty()) {
+        return;
+    }
+    if (s_hist_count >= kMaxHistory) {
+        for (int i = 1; i < kMaxHistory; ++i) {
+            s_hist_user[i - 1] = s_hist_user[i];
+            s_hist_reply[i - 1] = s_hist_reply[i];
+        }
+        --s_hist_count;
+    }
+    s_hist_user[s_hist_count] = user_text;
+    s_hist_reply[s_hist_count] = reply;
+    ++s_hist_count;
+}
+
 esp_err_t on_http_event(esp_http_client_event_t* evt)
 {
     if (evt->event_id == HTTP_EVENT_ON_DATA && evt->user_data != nullptr) {
@@ -305,6 +472,111 @@ std::string ask_llm(const std::string& user_text)
     }
 
     return reply;
+}
+
+
+// 流式问同一个问题：边收 reply 增量边回调，返回完整 JSON
+std::string ask_llm_stream(const std::string& user_text,
+                           const std::function<void(const std::string&)>& on_delta)
+{
+    if (g_lock == nullptr) {
+        g_lock = xSemaphoreCreateMutex();
+    }
+    if (g_lock != nullptr) {
+        xSemaphoreTake(g_lock, portMAX_DELAY);
+    }
+    struct Unlock {
+        SemaphoreHandle_t s;
+        ~Unlock() { if (s != nullptr) xSemaphoreGive(s); }
+    } unlock{g_lock};
+
+    const char* api_key = CONFIG_AMYAI_LLM_API_KEY;
+    if (api_key == nullptr || api_key[0] == '\0') {
+        ESP_LOGE(kTag, "没有配置 API Key");
+        return {};
+    }
+
+    // ---- 组装请求体（和 ask_llm 一样，只多一个 stream:true）----
+    cJSON* root = cJSON_CreateObject();
+    if (root == nullptr) {
+        return {};
+    }
+    cJSON_AddStringToObject(root, "model", kModel);
+    cJSON* messages = cJSON_AddArrayToObject(root, "messages");
+
+    cJSON* sys_msg = cJSON_CreateObject();
+    cJSON_AddStringToObject(sys_msg, "role", "system");
+    cJSON_AddStringToObject(sys_msg, "content", kSystemPrompt);
+    cJSON_AddItemToArray(messages, sys_msg);
+
+    for (int i = 0; i < s_hist_count; ++i) {
+        cJSON* h = cJSON_CreateObject();
+        cJSON_AddStringToObject(h, "role", "user");
+        cJSON_AddStringToObject(h, "content", s_hist_user[i].c_str());
+        cJSON_AddItemToArray(messages, h);
+
+        cJSON* a = cJSON_CreateObject();
+        cJSON_AddStringToObject(a, "role", "assistant");
+        cJSON_AddStringToObject(a, "content", s_hist_reply[i].c_str());
+        cJSON_AddItemToArray(messages, a);
+    }
+
+    cJSON* user_msg = cJSON_CreateObject();
+    cJSON_AddStringToObject(user_msg, "role", "user");
+    cJSON_AddStringToObject(user_msg, "content", user_text.c_str());
+    cJSON_AddItemToArray(messages, user_msg);
+
+    cJSON_AddNumberToObject(root, "temperature", 0.7);
+    cJSON_AddNumberToObject(root, "max_tokens", 64);
+    cJSON_AddBoolToObject(root, "stream", true);
+
+    char* body = cJSON_PrintUnformatted(root);
+    cJSON_Delete(root);
+    if (body == nullptr) {
+        return {};
+    }
+
+    const std::string auth = std::string("Bearer ") + api_key;
+
+    StreamCtx ctx;
+    ctx.cb = &on_delta;
+
+    esp_err_t err    = ESP_FAIL;
+    int       status = 0;
+
+    for (int attempt = 0; attempt < 2; ++attempt) {
+        esp_http_client_handle_t client = ensure_stream_client(auth);
+        if (client == nullptr) {
+            ESP_LOGE(kTag, "创建流式客户端失败");
+            free(body);
+            return {};
+        }
+        esp_http_client_set_post_field(client, body, static_cast<int>(strlen(body)));
+
+        ctx = StreamCtx{};
+        ctx.cb = &on_delta;
+        s_cur_stream = &ctx;
+
+        err    = esp_http_client_perform(client);
+        status = esp_http_client_get_status_code(client);
+        s_cur_stream = nullptr;
+
+        if (err == ESP_OK && status == 200) {
+            break;
+        }
+        ESP_LOGW(kTag, "流式请求异常(err=%s, status=%d)%s",
+                 esp_err_to_name(err), status, attempt == 0 ? "，重建连接重试" : "");
+        drop_stream_client();
+    }
+
+    free(body);
+
+    if (err != ESP_OK || status != 200) {
+        return {};
+    }
+
+    push_history(user_text, ctx.content);
+    return ctx.content;
 }
 
 void llm_reset_history()
