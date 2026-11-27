@@ -198,9 +198,20 @@ void pa_set(bool on)
     }
     if (err != ESP_OK) {
         ESP_LOGW(kTag, "功放控制写入失败: %s", esp_err_to_name(err));
-    } else if (on != s_pa_state) {
-        s_pa_state = on;
-        ESP_LOGI(kTag, "功放 %s", on ? "ON" : "OFF");
+    } else {
+        // 回读输出寄存器，确认 XL9555 真的写进去了（否则说明 I2C 假的成功）
+        uint8_t reg = 0x02;
+        uint8_t val = 0xFF;
+        if (i2c_master_transmit_receive(s_xl, &reg, 1, &val, 1, 100) == ESP_OK) {
+            if ((val & 0x20) != ((on ? 1u : 0u) << 5)) {
+                ESP_LOGW(kTag, "功放回读不一致：写 %s，回读 0x%02X", on ? "ON" : "OFF", val);
+            } else if (on != s_pa_state) {
+                s_pa_state = on;
+                ESP_LOGI(kTag, "功放 %s（回读 0x%02X 确认）", on ? "ON" : "OFF", val);
+            }
+        } else {
+            ESP_LOGW(kTag, "功放寄存器回读失败");
+        }
     }
 }
 
@@ -288,6 +299,8 @@ void WakeWord::run()
     int16_t tail = 0;      // 上一块最后一个样本（用于跨块插值）
     int filled = 0;        // feed 里已填多少
     int silent_secs = 0;   // 连续静音秒数，用于断流自愈
+    bool mic_dead = false; // 判定麦克风硬件故障（停止重启，语音输入停用）
+    int  mic_retry_secs = 0;  // 故障状态下每隔一段时间再试一次
     int read_fail = 0;     // I2S 读取失败次数（诊断用）
     int good_secs = 0;     // 连续有真实音频的秒数（判定恢复用）
     int log_sec = 0;       // 日志节拍（每 5 秒打一次电平）
@@ -349,6 +362,22 @@ void WakeWord::run()
     uint32_t vad_pk = 0;       // 当前 10ms 块的峰值
 
     while (true) {
+        // 配置模式暂停：不读 I2S、不喂 AFE，把 CPU 和音频通道让给配置页面
+        if (pause_request_) {
+            if (recording) {
+                recording = false;
+                rec_fill = 0;
+                afe_fill = 0;
+                speech_seen = false;
+                quiet_chunks = 0;
+                total_chunks = 0;
+                speech_chunks = 0;
+                silent_secs = 0;
+            }
+            vTaskDelay(pdMS_TO_TICKS(100));
+            continue;
+        }
+
         size_t got = 0;
         if (i2s_channel_read(s_rx, hw, sizeof(hw), &got, pdMS_TO_TICKS(1000)) != ESP_OK || got < 8) {
             ++read_fail;
@@ -411,7 +440,7 @@ void WakeWord::run()
                 total_chunks = 0;
                 speech_chunks = 0;
             }
-            if (recording && rec != nullptr && !listen_paused) {
+            if (recording && rec != nullptr && !listen_paused && !mic_dead) {
                 // ★ 硬保护：绝不能写越界（越界会破坏堆，导致状态机卡死）
                 if (rec_fill < kRecordSamples) {
                     rec[rec_fill++] = v;
@@ -637,6 +666,16 @@ void WakeWord::run()
                     // 用均值判断"真实音频"：单个 32768 尖峰的均值只有个位数，真实说话在几百以上
                     const bool has_real = (mean > 50);
                     ++log_sec;
+                    // 麦克风判定故障后，每隔 60 秒再试一次（接触问题可能自己恢复）
+                    if (mic_dead) {
+                        if (++mic_retry_secs >= 60) {
+                            mic_retry_secs = 0;
+                            mic_dead = false;
+                            silent_secs = 0;
+                            good_secs = 0;
+                            ESP_LOGW(kTag, "重新检测麦克风…");
+                        }
+                    }
                     // 暂停超时自恢复：防止提示音任务异常导致设备永久"失聪"
                     if (pause_cnt_get() > 0 &&
                         esp_timer_get_time() - s_pause_since_us > kPauseTimeoutUs) {
@@ -693,12 +732,32 @@ void WakeWord::run()
                         ++silent_secs;
                     }
 
-                    if (silent_secs >= 3) {
-                        // 实测：寄存器重放 / 长时钟停顿 / I2S 重建 / 换电源 / 断开 WiFi 都救不回来，
-                        // 只有整机重启有效。所以别浪费时间反复尝试，直接重启（约 3 秒恢复）。
-                        ESP_LOGE(kTag, "麦克风断流（%d 秒全 0），直接重启整机", silent_secs);
-                        vTaskDelay(pdMS_TO_TICKS(100));
-                        esp_restart();
+                    if (silent_secs >= 3 && !mic_dead) {
+                        // 实测：寄存器重放 / I2S 重建 / 换电源 / 断 WiFi 都救不回来，
+                        // 只有整机重启有时能恢复（麦克风接触不良时）。
+                        // 但重启次数要限制：换麦克风后仍然全 0 的板子会无限重启，
+                        // 那样连 WiFi / 配网 / TTS 都用不了，所以要能"放弃重启"。
+                        static RTC_NOINIT_ATTR uint32_t s_mic_restart_cnt;
+                        static RTC_NOINIT_ATTR uint32_t s_mic_magic;
+                        // RTC 内存掉电不清零，初值是随机的，必须用魔数判断是否有效
+                        if (esp_reset_reason() == ESP_RST_POWERON || s_mic_magic != 0xA5A5C0DEu) {
+                            s_mic_magic = 0xA5A5C0DEu;
+                            s_mic_restart_cnt = 0;
+                        }
+                        if (s_mic_restart_cnt < 5) {
+                            ++s_mic_restart_cnt;
+                            ESP_LOGE(kTag, "麦克风断流（%d 秒全 0），第 %u 次重启整机",
+                                     silent_secs, s_mic_restart_cnt);
+                            vTaskDelay(pdMS_TO_TICKS(100));
+                            esp_restart();
+                        }
+                        // 连续 5 次都救不回来 -> 判定硬件故障，停止重启，其他功能继续跑
+                        mic_dead = true;
+                        recording = false;
+                        speech_seen = false;
+                        ESP_LOGE(kTag, "麦克风连续 %u 次开机都断流，判定硬件故障："
+                                       "停止重启，语音输入停用（WiFi / 配网 / 播报仍可用）",
+                                 s_mic_restart_cnt);
                     }
                 }
             }

@@ -20,6 +20,7 @@
 #include "esp_log.h"
 #include "esp_netif.h"
 #include "esp_system.h"
+#include "driver/gpio.h"
 #include "esp_heap_caps.h"
 #include "esp_timer.h"
 #include "esp_wifi.h"
@@ -41,6 +42,9 @@
 #include "music_player.h"
 #include "uart_link.h"
 #include "wake_word.h"
+#include "audio_hub.h"
+#include "device_cfg.h"
+#include "web_portal.h"
 #include "wifi_prov.h"
 
 namespace {
@@ -88,6 +92,24 @@ const char* reason_name(uint8_t reason)
     case WIFI_REASON_AUTH_EXPIRE:          return "认证过期";
     default:                               return "其他原因";
     }
+}
+
+// 手机是否接入了我们自己的 AP（阶段 2：扫码进入配置页的触发条件）
+volatile bool g_ap_client_connected = false;
+
+void on_ap_client_event(void* /*arg*/, esp_event_base_t base, int32_t id, void* data)
+{
+    if (base != WIFI_EVENT) {
+        return;
+    }
+    if (id == WIFI_EVENT_AP_STACONNECTED) {
+        g_ap_client_connected = true;
+        ESP_LOGW(kTag, "检测到手机接入设备 AP");
+    } else if (id == WIFI_EVENT_AP_STADISCONNECTED) {
+        g_ap_client_connected = false;
+        ESP_LOGW(kTag, "手机已断开设备 AP");
+    }
+    (void)data;
 }
 
 class WifiStation {
@@ -573,6 +595,49 @@ extern "C" void app_main(void)
     }
     ESP_ERROR_CHECK(err);
 
+    // ================= 配网判定（必须在音频初始化之前）=================
+    // 网页配网模式不初始化音频 / AFE / TTS，把内部 RAM 全让给 AP + HTTP 服务。
+    // 凭据来源优先级：编译期配置 > 网页配网保存的 NVS > 旧 BLE 配网留下的配置
+    static WifiStation sta;
+    if (sta.init() != ESP_OK) {
+        ESP_LOGE(kTag, "Wi-Fi 初始化失败");
+        return;
+    }
+
+#if CONFIG_AMYAI_PROV_ENABLE
+    // 开机时按住 BOOT 键 -> 恢复出厂：清掉凭据后重启，下次启动自动进配网
+    if (prov_detect_reset_request()) {
+        prov_reset();
+        user_data_erase();
+        ESP_LOGW(kTag, "已恢复出厂设置，1 秒后重启…");
+        vTaskDelay(pdMS_TO_TICKS(1000));
+        esp_restart();
+    }
+#endif
+
+    std::string ssid     = CONFIG_AMYAI_WIFI_SSID;
+    std::string password = CONFIG_AMYAI_WIFI_PASSWORD;
+    if (ssid.empty()) {
+        char s_buf[33] = {0};
+        char p_buf[65] = {0};
+        if (user_wifi_load(s_buf, sizeof(s_buf), p_buf, sizeof(p_buf))) {
+            ssid     = s_buf;
+            password = p_buf;
+            ESP_LOGI(kTag, "使用网页配网保存的 Wi-Fi 凭据: \"%s\"", ssid.c_str());
+        }
+    }
+#if CONFIG_AMYAI_PROV_ENABLE
+    if (ssid.empty() && prov_load_credentials(ssid, password)) {
+        ESP_LOGI(kTag, "使用旧的 BLE 配网凭据: \"%s\"", ssid.c_str());
+    }
+#endif
+
+    // 没有任何 Wi-Fi 凭据 -> 进入网页配网（阻塞，保存后重启）
+    if (ssid.empty()) {
+        web_portal_run();
+        return;
+    }
+
     // 主控通信：先初始化 UART，后面识别出的指令直接走它
     if (uart_link_init()) {
         ESP_LOGI(kTag, "主控通信已就绪（UART1）");
@@ -583,7 +648,35 @@ extern "C" void app_main(void)
     tts_init();
     reply_player_init();   // 流式回复播放器（边生成边播报）
 
+
     // 唤醒词：不依赖 Wi-Fi，先启动。引脚没配好时只报警告，不影响后面的联网流程。
+    // ★ 诊断：I2S 初始化前，把麦克风数据脚（IO47）当普通 GPIO 读电平，
+    //   判断是"线悬空（麦没驱动）"还是"被拉低（短路/麦不出数据）"。
+    {
+        const gpio_num_t kMicPin = GPIO_NUM_47;
+        auto probe = [&](bool pull_up, const char* name) {
+            gpio_config_t io = {};
+            io.pin_bit_mask = 1ULL << kMicPin;
+            io.mode         = GPIO_MODE_INPUT;
+            io.pull_up_en   = pull_up ? GPIO_PULLUP_ENABLE : GPIO_PULLUP_DISABLE;
+            io.pull_down_en = pull_up ? GPIO_PULLDOWN_DISABLE : GPIO_PULLDOWN_ENABLE;
+            io.intr_type    = GPIO_INTR_DISABLE;
+            gpio_config(&io);
+            int high = 0;
+            for (int i = 0; i < 200; ++i) {
+                if (gpio_get_level(kMicPin)) {
+                    ++high;
+                }
+                vTaskDelay(pdMS_TO_TICKS(2));
+            }
+            ESP_LOGW(kTag, "[麦克风线] 内部%s时 IO47 高电平 %d/200", name, high);
+        };
+        probe(true,  "上拉");
+        probe(false, "下拉");
+        ESP_LOGW(kTag, "[麦克风线] 判读：上拉读 1 且下拉读 0 = 线悬空（麦没驱动）；"
+                       "两次都 0 = 被拉低；两次都 1 = 被拉高");
+    }
+
     static WakeWord wake;
     const bool wake_ok = wake.start(
         [&] {
@@ -887,59 +980,31 @@ extern "C" void app_main(void)
         ESP_LOGW(kTag, "唤醒功能未启动（多半是 I2S 引脚没配置），继续跑联网部分");
     }
 
+    // ★ 开机自检音：必须放在 wake.start() 之后 —— 音频总线在那里才初始化好，
+    //   早于它调用 audio_hub_play_pcm 会因为 s_tx == nullptr 直接静默返回。
+    if (wake_ok) {
+        static int16_t beep[24000];   // 1 秒 @24kHz 单声道
+        for (int i = 0; i < 24000; ++i) {
+            float env = 1.0f;
+            if (i < 1200) env = static_cast<float>(i) / 1200.0f;
+            else if (i > 22800) env = static_cast<float>(24000 - i) / 1200.0f;
+            // 440Hz 方波，幅度拉满到 24000（约 73%），比之前响很多
+            beep[i] = static_cast<int16_t>(24000.0f * env * (((i / 27) % 2) ? 1.0f : -1.0f));
+        }
+        for (int k = 0; k < 3; ++k) {
+            const bool ok = audio_hub_play_pcm(beep, 24000, 24000, AUDIO_PRIO_PROMPT);
+            ESP_LOGW(kTag, "开机自检音 #%d 播放%s（应该能听到 1 秒嘀声）",
+                     k + 1, ok ? "完成" : "失败");
+            vTaskDelay(pdMS_TO_TICKS(300));
+        }
+    }
+
     // 开机内存快照：内部 RAM 是本板最紧张的资源（WiFi + TLS 都从这里要）
     AMYAI_DIAGI(kTag, "[内存] 连网前：内部 %u 空闲（最大块 %u）| PSRAM %u 空闲",
                 static_cast<unsigned>(heap_caps_get_free_size(MALLOC_CAP_INTERNAL)),
                 static_cast<unsigned>(heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL)),
                 static_cast<unsigned>(heap_caps_get_free_size(MALLOC_CAP_SPIRAM)));
 
-    static WifiStation sta;
-    if (sta.init() != ESP_OK) {
-        ESP_LOGE(kTag, "Wi-Fi 初始化失败");
-        return;
-    }
-
-#if CONFIG_AMYAI_PROV_ENABLE
-    // 开机时按住 BOOT 键 -> 恢复出厂：清掉凭据后重启，下次启动自动进配网
-    if (prov_detect_reset_request()) {
-        prov_reset();
-        ESP_LOGW(kTag, "已恢复出厂设置，1 秒后重启…");
-        vTaskDelay(pdMS_TO_TICKS(1000));
-        esp_restart();
-    }
-#endif
-
-    std::string ssid     = CONFIG_AMYAI_WIFI_SSID;
-    std::string password = CONFIG_AMYAI_WIFI_PASSWORD;
-
-    // 编译期没填 SSID 时，优先用上次配网保存在 NVS 里的凭据
-    if (ssid.empty()) {
-        if (prov_load_credentials(ssid, password)) {
-            ESP_LOGI(kTag, "使用已保存的 Wi-Fi 凭据: \"%s\"", ssid.c_str());
-        }
-    }
-
-#if CONFIG_AMYAI_PROV_ENABLE
-    // 还是没有任何凭据 -> 进入 BLE 配网
-    if (ssid.empty()) {
-        ESP_LOGW(kTag, "没有可用的 Wi-Fi 凭据，进入 BLE 配网流程");
-        prov_run_ble(static_cast<uint32_t>(CONFIG_AMYAI_PROV_TIMEOUT_SEC) * 1000U);
-
-        if (!prov_load_credentials(ssid, password)) {
-            ESP_LOGE(kTag, "配网没完成，先扫描附近网络供你核对 SSID/信号");
-            sta.start();
-            sta.scan_nearby();
-            return;
-        }
-        ESP_LOGI(kTag, "配网完成，目标 Wi-Fi: \"%s\"", ssid.c_str());
-
-        // ★ 配网用完蓝牙后重启一次：让 BT 占用的内部内存彻底还回来，
-        //   避免后面 TLS 建连时因为内存碎片失败（重启后就是纯 STA 模式，内存最干净）。
-        ESP_LOGW(kTag, "配网完成，重启一次以释放蓝牙内存…");
-        vTaskDelay(pdMS_TO_TICKS(500));
-        esp_restart();
-    }
-#endif
 
 #if CONFIG_AMYAI_SKIP_WIFI_FOR_TEST
     // 排查用：完全不启动 WiFi，观察麦克风断流是否消失。
@@ -979,23 +1044,73 @@ extern "C" void app_main(void)
     check_internet();
     g_net_ready = true;   // 到这里才算真正可用了，之前唤醒会提示"网络未就绪"
     ESP_LOGI(kTag, "======== 网络就绪，可以开始语音交互 ========");
-    // （原来那个固定语句的联调循环已经去掉，避免和语音链路抢 HTTP 连接）
 
-    // 之后周期性打印链路质量并复测外网
-    // 网络看门狗：连续多次连不上外网就整机重启（WiFi 偶尔会卡死，重启最快恢复）
+    // ================= 阶段 2：AP 常开（手机随时可扫码进入配置页）=================
+    {
+        uint8_t primary = 0;
+        wifi_second_chan_t second = WIFI_SECOND_CHAN_NONE;
+        esp_wifi_get_channel(&primary, &second);   // AP 必须跟随 STA 信道
+        web_portal_ap_start(primary);
+        esp_event_handler_instance_register(WIFI_EVENT, WIFI_EVENT_AP_STACONNECTED,
+                                            &on_ap_client_event, nullptr, nullptr);
+        esp_event_handler_instance_register(WIFI_EVENT, WIFI_EVENT_AP_STADISCONNECTED,
+                                            &on_ap_client_event, nullptr, nullptr);
+        ESP_LOGW(kTag, "AP 已常开（隐藏网络）。扫码连上后会自动进入配置模式，"
+                       "可修改身体信息；配置完成后需要重新唤醒");
+    }
+
+    // 主循环：500ms 一拍，负责配置模式切换 + 网络看门狗
+    constexpr int64_t kCfgTimeoutUs = 5LL * 60 * 1000 * 1000;   // 配置模式最长 5 分钟
     int net_fail = 0;
+    int tick = 0;
+    bool cfg_active = false;
+    bool wait_disconnect = false;   // 退出配置模式后，等手机真正断开才允许再进入
+    int64_t cfg_start_us = 0;
+
     while (true) {
-        vTaskDelay(pdMS_TO_TICKS(kPsramCheckMs));
-        sta.log_link_info();
-        if (check_internet()) {
-            net_fail = 0;
-        } else {
-            ++net_fail;
-            ESP_LOGW(kTag, "连续 %d 次连不上外网", net_fail);
-            if (net_fail >= 3) {
-                ESP_LOGE(kTag, "网络持续不可用，重启整机恢复");
-                vTaskDelay(pdMS_TO_TICKS(200));
-                esp_restart();
+        vTaskDelay(pdMS_TO_TICKS(500));
+
+        // ---- 每 2 秒处理一次配置模式 ----
+        if (++tick % 4 == 0) {
+            const bool want = g_ap_client_connected;
+            if (!want) {
+                wait_disconnect = false;   // 手机断开了，下次接入可以重新进入
+            }
+            if (want && !cfg_active && !wait_disconnect) {
+                cfg_active = true;
+                cfg_start_us = esp_timer_get_time();
+                ESP_LOGW(kTag, "==== 进入配置模式：暂停语音 + 启动配置页 ====");
+                if (music_is_playing()) {
+                    music_stop();
+                    wake.set_music_window(false);
+                }
+                wake.pause();                  // 唤醒任务完全暂停（不录音不检测）
+                web_portal_http_start();
+            } else if (cfg_active &&
+                       (!want || web_portal_config_done_take() ||
+                        esp_timer_get_time() - cfg_start_us > kCfgTimeoutUs)) {
+                cfg_active = false;
+                wait_disconnect = true;        // 手机还连着的话不要立刻又进来
+                web_portal_http_stop();
+                wake.resume();
+                wake.sleep_now();              // 回到"需要重新唤醒"状态
+                ESP_LOGW(kTag, "==== 退出配置模式：恢复语音，需要重新喊唤醒词 ====");
+            }
+        }
+
+        // ---- 每 60 秒做一次网络检查（配置模式下跳过，避免误重启）----
+        if (tick % 120 == 0 && !cfg_active) {
+            sta.log_link_info();
+            if (check_internet()) {
+                net_fail = 0;
+            } else {
+                ++net_fail;
+                ESP_LOGW(kTag, "连续 %d 次连不上外网", net_fail);
+                if (net_fail >= 3) {
+                    ESP_LOGE(kTag, "网络持续不可用，重启整机恢复");
+                    vTaskDelay(pdMS_TO_TICKS(200));
+                    esp_restart();
+                }
             }
         }
     }

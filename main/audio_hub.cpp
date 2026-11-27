@@ -1,5 +1,7 @@
 #include "audio_hub.h"
 
+#include "diag.h"
+
 #include <cmath>
 #include <cstring>
 
@@ -135,6 +137,11 @@ static void keepalive_task(void*)
 {
     static int16_t sil[256 * 2] = {};   // 256 帧立体声静音（约 5.8ms）
     static int quiet_rounds = 0;
+    // 诊断：统计保活写入次数，用来判断 I2S TX 时钟是否真的在跑
+    // （TX 不跑 -> 数字麦克风没时钟 -> 采到的全是 0）
+    uint32_t ok_cnt = 0;
+    uint32_t fail_cnt = 0;
+    uint32_t last_log_ms = 0;
     while (true) {
         if (!s_busy && s_tx != nullptr) {
             if (xSemaphoreTake(s_lock, 0) == pdTRUE) {
@@ -144,14 +151,24 @@ static void keepalive_task(void*)
                     const esp_err_t r = i2s_channel_write(s_tx, sil, sizeof(sil), &written,
                                                           pdMS_TO_TICKS(200));
                     if (r != ESP_OK) {
+                        ++fail_cnt;
                         if (++quiet_rounds <= 2) {
                             ESP_LOGW(kTag, "保活写入失败: %s", esp_err_to_name(r));
                         }
                     } else {
                         quiet_rounds = 0;
+                        ++ok_cnt;
                     }
                 }
                 xSemaphoreGive(s_lock);
+            }
+            const uint32_t now_ms = static_cast<uint32_t>(esp_log_timestamp());
+            if (last_log_ms == 0) {
+                last_log_ms = now_ms;
+            } else if (now_ms - last_log_ms >= 5000) {
+                last_log_ms = now_ms;
+                AMYAI_DIAGI(kTag, "[TX保活] 成功 %u 次 / 失败 %u 次（成功>0 说明 I2S 时钟在跑）",
+                            static_cast<unsigned>(ok_cnt), static_cast<unsigned>(fail_cnt));
             }
             vTaskDelay(1);   // 让出 CPU，下一轮继续喂
         } else {
