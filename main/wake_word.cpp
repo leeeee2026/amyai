@@ -336,7 +336,8 @@ void WakeWord::run()
     int rec_fill = 0;
 
     // VAD 断句状态
-    int speech_start = 0;      // 本次录音中人声起点（AFE 缓冲下标）
+    int speech_start = 0;      // 人声起点（AFE 缓冲下标，给离线识别用）
+    int speech_start_raw = 0;  // 人声起点（rec 原始缓冲下标，给云端 ASR 用）
     int dbg_pk_max = 0;        // 本秒内 10ms 块的最大峰值（诊断）
     int vad_acc = 0;           // 当前 10ms 块的能量累加
     int vad_n = 0;             // 当前块已累计样本数
@@ -455,13 +456,15 @@ void WakeWord::run()
                                     ESP_LOGI(kTag, "音乐窗口：检测到人声（峰值 %d）", pk);
                                 }
                                 if (!speech_seen) {
-                                    // ★ 记下人声起点：VAD 判定的这一刻往回留 300ms，
-                                    //   之后直接把 [起点, 结尾] 交给离线识别，不用再猜裁剪位置。
+                                    // ★ 记下人声起点：VAD 判定的这一刻往回留 300ms。
+                                    //   AFE 缓冲给离线识别用，rec 原始缓冲给云端 ASR 用——
+                                    //   两路都用 VAD 的精确边界，不再靠阈值猜裁剪位置。
                                     constexpr int kPreMargin = kAfeRate * 300 / 1000;
-                                    const int at = afe_fill - kPreMargin;
-                                    speech_start = (at > 0) ? at : 0;
-                                    AMYAI_DIAGI(kTag, "人声起点：第 %d 样本（%d ms）",
-                                             speech_start, speech_start * 1000 / kAfeRate);
+                                    speech_start = (afe_fill > kPreMargin) ? (afe_fill - kPreMargin) : 0;
+                                    speech_start_raw = (rec_fill > kPreMargin) ? (rec_fill - kPreMargin) : 0;
+                                    AMYAI_DIAGI(kTag, "人声起点：AFE 第 %d 样本（%d ms），原始第 %d 样本",
+                                             speech_start, speech_start * 1000 / kAfeRate,
+                                             speech_start_raw);
                                 }
                                 speech_seen = true;
                             }
@@ -522,7 +525,29 @@ void WakeWord::run()
                         if (on_utterance_) {
                             s_afe_pcm_len = static_cast<size_t>(afe_fill);
                             s_afe_pcm_start = static_cast<size_t>(speech_start);
-                            on_utterance_(rec, static_cast<size_t>(rec_fill));
+
+                            // ★ 云端 ASR 也只传人声段（不再靠 asr_client 里的阈值猜）：
+                            //   起点用 VAD 判定的位置，结尾去掉多余的尾部静音，
+                            //   只保留 250ms 尾音让云端解码器收尾。
+                            size_t speech_len = static_cast<size_t>(rec_fill);
+                            if (speech_start_raw > 0 &&
+                                static_cast<size_t>(speech_start_raw) < speech_len) {
+                                speech_len -= static_cast<size_t>(speech_start_raw);
+                            } else {
+                                speech_start_raw = 0;
+                            }
+                            if (vad_done) {
+                                constexpr int kTailKeep = kAfeRate * 250 / 1000;
+                                const int quiet_samples = quiet_chunks * (kAfeRate / 100);
+                                if (quiet_samples > kTailKeep &&
+                                    static_cast<size_t>(quiet_samples - kTailKeep) < speech_len) {
+                                    speech_len -= static_cast<size_t>(quiet_samples - kTailKeep);
+                                }
+                            }
+                            AMYAI_DIAGI(kTag, "交给云端 ASR：%u 样本（%.1f 秒，已按 VAD 边界裁剪）",
+                                        static_cast<unsigned>(speech_len),
+                                        static_cast<float>(speech_len) / kAfeRate);
+                            on_utterance_(rec + speech_start_raw, speech_len);
 #if AMYAI_DIAG_ENABLE
                             // 处理完一轮后打一次资源水位：查栈溢出 / 内存泄漏
                             AMYAI_DIAGI(kTag, "[资源] 唤醒任务剩余栈 %u 字节 | 内部RAM %u 空闲(最大块 %u) | PSRAM %u 空闲",

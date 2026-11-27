@@ -105,28 +105,8 @@ std::string asr_transcribe(const int16_t* pcm, size_t samples)
         return {};
     }
 
-    // ★ 裁掉前后静音：唤醒应答前后往往有 0.5~1 秒空白，
-    //   一起上传既慢又让云端多算。留 150ms 余量避免切掉字头。
-    {
-        constexpr int kThresh = 600;          // 静音判断阈值
-        constexpr size_t kMargin = 16000 * 150 / 1000;   // 两侧各留 150ms
-        size_t first = 0;
-        size_t last = samples - 1;
-        while (first < samples && std::abs(static_cast<int>(pcm[first])) < kThresh) ++first;
-        while (last > first && std::abs(static_cast<int>(pcm[last])) < kThresh) --last;
-        if (first < last) {
-            const size_t start = (first > kMargin) ? (first - kMargin) : 0;
-            const size_t end = (last + kMargin < samples) ? (last + kMargin) : (samples - 1);
-            const size_t new_len = end - start + 1;
-            if (new_len + 1600 < samples) {     // 至少省 100ms 才值得裁
-                ESP_LOGI(kTag, "裁静音：%u -> %u 样本（省 %u ms）",
-                         static_cast<unsigned>(samples), static_cast<unsigned>(new_len),
-                         static_cast<unsigned>((samples - new_len) * 1000 / rate));
-                pcm += start;
-                samples = new_len;
-            }
-        }
-    }
+    // 注意：静音裁剪已经在 wake_word 里用 VAD 的精确人声边界做完了
+    // （见 wake_task 里"交给云端 ASR"那段），这里不再用阈值猜，避免二次误裁。
 
     const uint32_t data_bytes = static_cast<uint32_t>(samples * sizeof(int16_t));
 
