@@ -153,7 +153,11 @@ static const LocalCmdEntry kLocalCmds[] = {
     {45, "jing chui mo shi", "颈椎模式", R"({"cmd":"set_program","program":"neck"})"},
     {46, "yao zhui mo shi", "腰椎模式", R"({"cmd":"set_program","program":"waist"})"},
     {46, "hu yao mo shi", "护腰模式", R"({"cmd":"set_program","program":"waist"})"},
+    {47, "tui xia", "退下", R"({"cmd":"sleep"})"},
+    {47, "tui xia ba", "退下吧", R"({"cmd":"sleep"})"},
+    {47, "mei shi le", "没事了", R"({"cmd":"sleep"})"},
+    {47, "bu yong le", "不用了", R"({"cmd":"sleep"})"},
 };
 
 static constexpr int kLocalCmdCount = static_cast<int>(sizeof(kLocalCmds) / sizeof(kLocalCmds[0]));
-static constexpr int kLocalCmdMaxId = 46;
+static constexpr int kLocalCmdMaxId = 47;

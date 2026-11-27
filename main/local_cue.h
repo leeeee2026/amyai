@@ -28,5 +28,8 @@ void local_play_ack();
 // 异步播放「好的，马上为您调整」（本地命令词命中时用；同样延迟 500ms）
 void local_play_ok();
 
+// 异步播放「好的，有需要随时叫我」（退出唤醒时用；同样延迟 500ms）
+void local_play_bye();
+
 // 播放「网络还没连上，请稍等」提示音（本地音频，不依赖网络；有 15 秒冷却，避免刷屏）
 void local_play_no_net();

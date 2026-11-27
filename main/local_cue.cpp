@@ -12,6 +12,7 @@
 #include "wake_word.h"
 #include "prompt_hao_de.h"
 #include "prompt_hao_ok.h"
+#include "prompt_bye.h"
 #include "prompt_no_net.h"
 
 namespace {
@@ -165,4 +166,10 @@ bool local_is_music_command(const std::string& text)
         }
     }
     return false;
+}
+
+// 退出唤醒：「好的，有需要随时叫我」
+void local_play_bye()
+{
+    spawn_cue("bye", kPromptBye, kPromptByeLen, kPromptByeRate, 3072);
 }

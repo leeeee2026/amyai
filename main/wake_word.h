@@ -48,6 +48,10 @@ public:
     // 取消连续聆听（比如没网、ASR 失败时，避免疯狂重录）
     void cancel_follow_up() { cancel_follow_up_ = true; }
 
+    // 休眠：停止录音、不再响应任何指令，只有重新喊唤醒词才会恢复
+    void sleep_now() { sleep_request_ = true; }
+    bool sleeping() const { return sleeping_; }
+
 private:
     static void task_entry(void* arg);
     void run();
@@ -58,4 +62,6 @@ private:
     bool music_window_ = false;
     bool force_follow_up_ = false;
     bool cancel_follow_up_ = false;
+    bool sleep_request_ = false;
+    volatile bool sleeping_ = false;
 };

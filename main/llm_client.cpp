@@ -52,6 +52,7 @@ reply 里不要出现英文单引号或双引号，需要引号时用中文「�
 问你能做什么 -> {"reply":"...","intent":"intro"}
 用户明确要音乐/歌/曲时才用（没提音乐的一律 chat/unknown） -> {"reply":"","intent":"music","action":"play|stop|next","query":"..."}（music 的 reply 必须为空字符串，直接执行不播报）
 不懂/无关 -> {"reply":"...","intent":"unknown"}
+用户让退出/退下/没事了/不用了 -> {"reply":"","intent":"sleep"}（回复由系统固定播报，reply 必须为空）
 
 【控制指令】
 start/stop/pause/resume（这四个起停指令的 reply 必须是空字符串 ""，直接执行不播报）

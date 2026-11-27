@@ -185,9 +185,10 @@ bool reply_player_init()
         ESP_LOGE(kTag, "流式播放器初始化失败（内存不足）");
         return false;
     }
-    // ★ 任务栈放 PSRAM：这个任务要跑 TTS 的 TLS 请求，需要 ~12KB 栈，
-    //   放内部 RAM 会把堆挤爆（实测导致 lwip 分配信号量失败、DNS 直接崩）。
-    if (xTaskCreateWithCaps(consumer_task, "reply_play", 12 * 1024, nullptr, 4,
+    // ★ 任务栈放 PSRAM：这个任务要跑 TTS 的 TLS 握手，实测需要 20KB
+    //   （12KB 会在 mbedtls_ssl_handshake 里栈溢出 panic）。
+    //   放 PSRAM 是为了不挤爆内部 RAM（内部堆崩了会导致 lwip 分配失败、DNS 崩溃）。
+    if (xTaskCreateWithCaps(consumer_task, "reply_play", 20 * 1024, nullptr, 4,
                             nullptr, MALLOC_CAP_SPIRAM) != pdPASS) {
         ESP_LOGE(kTag, "播放任务创建失败");
         return false;

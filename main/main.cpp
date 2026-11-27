@@ -619,6 +619,17 @@ extern "C" void app_main(void)
                 const int16_t* afe_pcm = wake_afe_pcm(&afe_len);
                 std::string local_cmd;
                 if (afe_pcm != nullptr && local_asr_recognize(afe_pcm, afe_len, &local_cmd)) {
+                    // ★ 退出唤醒：只回一句告别语，不下发主控，之后进入休眠
+                    if (local_cmd.find("\"sleep\"") != std::string::npos) {
+                        ESP_LOGI(kTag, "【本地】退出唤醒（退下）");
+                        if (music_is_playing()) {
+                            music_stop();
+                            wake.set_music_window(false);
+                        }
+                        local_play_bye();       // 「好的，有需要随时叫我」
+                        wake.sleep_now();       // 停录音，等重新唤醒
+                        return;
+                    }
                     local_play_ok();     // 「好的，马上为您调整」（延迟 500ms 播）
                     if (validate_command(local_cmd)) {
                         if (uart_link_send_command(local_cmd)) {
@@ -755,6 +766,19 @@ extern "C" void app_main(void)
             cJSON* intent_item = cJSON_GetObjectItem(root, "intent");
             const char* intent = cJSON_IsString(intent_item) ? intent_item->valuestring : "control";
 
+            if (std::strcmp(intent, "sleep") == 0) {
+                // 云端也支持"退下"：回告别语后休眠
+                ESP_LOGI(kTag, "【休眠】");
+                if (music_is_playing()) {
+                    music_stop();
+                    wake.set_music_window(false);
+                }
+                local_play_bye();
+                wake.sleep_now();
+                cJSON_Delete(root);
+                reply_player_wait_done(20000);
+                return;
+            }
             if (std::strcmp(intent, "chat") == 0) {
                 cJSON* r = cJSON_GetObjectItem(root, "reply");
                 if (cJSON_IsString(r) && r->valuestring[0] != '\0') {

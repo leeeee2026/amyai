@@ -593,6 +593,14 @@ void WakeWord::run()
                             enabled_ = true;            // 音乐窗口里也允许说唤醒词
                             noise_pk = 1200;
                             audio_hub_set_music_volume(CONFIG_AMYAI_MUSIC_DUCK_PERCENT);   // 只压低音乐（TTS/提示音不受影响）
+                        } else if (sleep_request_) {
+                            sleep_request_ = false;
+                            sleeping_ = true;
+                            recording = false;
+                            follow_up_mode = false;
+                            follow_up_turns = 0;
+                            enabled_ = false;
+                            ESP_LOGI(kTag, "已休眠：停止录音，只有重新喊唤醒词才会响应");
                         } else if (cancel_follow_up_) {
                             cancel_follow_up_ = false;
                             recording = false;
@@ -720,6 +728,10 @@ void WakeWord::run()
                     if (res->wakeup_state == WAKENET_DETECTED) {
                         if (!enabled_) {
                             ESP_LOGI(kTag, "录音中再次听到唤醒词，重新开始一轮");
+                        }
+                        if (sleeping_) {
+                            ESP_LOGI(kTag, "从休眠中被唤醒");
+                            sleeping_ = false;
                         }
                         ESP_LOGI(kTag, "★ 唤醒命中: \"%s\"", CONFIG_AMYAI_WAKE_TEXT);
                         enabled_ = false;   // 录音+处理期间不再响应唤醒，避免连续触发
