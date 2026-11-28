@@ -27,3 +27,12 @@ void web_portal_http_stop();
 
 // 配置是否已完成（页面提交了身体信息）—— 取走标志并清零
 bool web_portal_config_done_take();
+
+// 本次配网提交过 Wi-Fi 且已连上 → 取走标志返回 true（用于"连上就退出配网"）
+bool web_portal_wifi_done_take();
+
+// 页面是否请求进入"配网模式"（true 时暂停语音、显示 Wi-Fi 表单）
+bool web_portal_prov_wanted();
+
+// 强制退出配网模式（超时兜底）
+void web_portal_prov_clear();

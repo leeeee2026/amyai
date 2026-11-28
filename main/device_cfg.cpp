@@ -15,6 +15,7 @@ constexpr const char* kTag = "cfg";
 // 用户身体信息
 constexpr const char* kNsUser = "user";
 constexpr const char* kKeyProf = "profile";
+constexpr const char* kKeyPrefs = "prefs";
 
 // Wi-Fi 凭据（我们自己的副本，和 WiFi 驱动内部存储互相独立）
 constexpr const char* kNsWifi = "amyai_wifi";
@@ -139,4 +140,85 @@ void user_data_erase()
         nvs_close(h);
     }
     ESP_LOGW(kTag, "用户数据已清空");
+}
+
+// ---------------------------------------------------------------- 偏好设置
+namespace {
+constexpr uint8_t kPrefsMagic = 0xA7;   // 结构版本，改字段时改这里
+}
+
+void user_prefs_defaults(UserPrefs* out)
+{
+    if (out == nullptr) {
+        return;
+    }
+    UserPrefs d{};
+    d.program       = 0;      // 全身放松
+    d.strength      = 3;
+    d.speed         = 1;      // 中
+    d.duration_min  = 20;
+    d.parts_mask    = 0x07;   // 颈+肩+背
+    d.air_neck      = 1;
+    d.air_shoulder  = 1;
+    d.air_arm       = 1;
+    d.air_leg       = 1;
+    d.air_foot      = 1;
+    d.foot_roller   = 2;      // 中
+    d.heat_mask     = 0x03;   // 腰背+腿
+    d.heat_temp     = 45;
+    d.volume        = 70;
+    d.tts_speed     = 1;
+    d.tts_voice     = 1;
+    d.follow_up_sec = 600;
+    d.ack_enabled   = 1;
+    d.child_lock    = 0;
+    d.sedentary_min = 0;
+    d.magic         = kPrefsMagic;
+    *out = d;
+}
+
+bool user_prefs_load(UserPrefs* out)
+{
+    if (out == nullptr) {
+        return false;
+    }
+    user_prefs_defaults(out);   // 先给默认值，读失败就是出厂状态
+
+    nvs_handle_t h = 0;
+    if (nvs_open(kNsUser, NVS_READONLY, &h) != ESP_OK) {
+        return false;
+    }
+    UserPrefs tmp{};
+    size_t len = sizeof(UserPrefs);
+    const esp_err_t err = nvs_get_blob(h, kKeyPrefs, &tmp, &len);
+    nvs_close(h);
+    if (err != ESP_OK || len != sizeof(UserPrefs) || tmp.magic != kPrefsMagic) {
+        return false;   // 没保存过，或结构变了
+    }
+    *out = tmp;
+    return true;
+}
+
+bool user_prefs_save(const UserPrefs& in)
+{
+    UserPrefs v = in;
+    v.magic = kPrefsMagic;
+
+    nvs_handle_t h = 0;
+    if (nvs_open(kNsUser, NVS_READWRITE, &h) != ESP_OK) {
+        ESP_LOGE(kTag, "打开 NVS(user) 失败");
+        return false;
+    }
+    const esp_err_t err = nvs_set_blob(h, kKeyPrefs, &v, sizeof(UserPrefs));
+    if (err == ESP_OK) {
+        nvs_commit(h);
+    }
+    nvs_close(h);
+    if (err != ESP_OK) {
+        ESP_LOGE(kTag, "保存偏好失败: %s", esp_err_to_name(err));
+        return false;
+    }
+    ESP_LOGI(kTag, "偏好已保存：力度=%u 速度=%u 时长=%u 部位=0x%02X 音量=%u",
+             v.strength, v.speed, v.duration_min, v.parts_mask, v.volume);
+    return true;
 }

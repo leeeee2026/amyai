@@ -1040,16 +1040,16 @@ extern "C" void app_main(void)
                                             &on_ap_client_event, nullptr, nullptr);
         esp_event_handler_instance_register(WIFI_EVENT, WIFI_EVENT_AP_STADISCONNECTED,
                                             &on_ap_client_event, nullptr, nullptr);
-        ESP_LOGW(kTag, "AP 已常开（隐藏网络）。扫码连上后会自动进入配置模式，"
+        ESP_LOGW(kTag, "AP 已常开。扫码或手动连上后会自动进入配置模式，"
                        "可修改身体信息；配置完成后需要重新唤醒");
     }
 
     // 主循环：500ms 一拍，负责配置模式切换 + 网络看门狗
-    constexpr int64_t kCfgTimeoutUs = 5LL * 60 * 1000 * 1000;   // 配置模式最长 5 分钟
+    constexpr int64_t kCfgTimeoutUs = 10LL * 60 * 1000 * 1000;   // 配置模式最长 10 分钟
     int net_fail = 0;
     int tick = 0;
-    bool cfg_active = false;
-    bool wait_disconnect = false;   // 退出配置模式后，等手机真正断开才允许再进入
+    bool cfg_active = false;        // 配网模式（语音暂停）
+    bool http_on = false;           // 配置页（HTTP 服务）是否在跑
     int64_t cfg_start_us = 0;
 
     while (true) {
@@ -1066,29 +1066,47 @@ extern "C" void app_main(void)
                 }
             }
             const bool want = g_ap_client_connected;
-            if (!want) {
-                wait_disconnect = false;   // 手机断开了，下次接入可以重新进入
+
+            // ---- HTTP 服务：手机连着就一直开着（页面随时可用）----
+            if (want && !http_on) {
+                if (web_portal_http_start()) {
+                    http_on = true;
+                    ESP_LOGW(kTag, "手机接入：配置页已启动（语音继续运行）");
+                } else {
+                    // 启动失败（内存/端口）下一拍重试，不能把标志置上假装成功
+                    ESP_LOGE(kTag, "配置页启动失败，稍后重试");
+                }
+            } else if (!want && http_on) {
+                web_portal_http_stop();
+                http_on = false;
+                ESP_LOGW(kTag, "手机断开：配置页已关闭");
             }
-            if (want && !cfg_active && !wait_disconnect) {
+
+            // ---- 语音暂停只看"页面是否请求了配网模式" ----
+            //   首次没配网 / 用户点了「重新配置 Wi-Fi」 -> 暂停语音
+            //   配网成功或用户退出配网 -> 恢复语音
+            // ★ 兜底：配网模式最长 10 分钟，防止用户点进去就不管了导致语音一直停着
+            if (cfg_active && esp_timer_get_time() - cfg_start_us > kCfgTimeoutUs) {
+                ESP_LOGW(kTag, "配网模式超时，强制退出");
+                web_portal_prov_clear();
+            }
+            const bool prov = want && web_portal_prov_wanted();
+            if (prov && !cfg_active) {
                 cfg_active = true;
                 cfg_start_us = esp_timer_get_time();
-                ESP_LOGW(kTag, "==== 进入配置模式：暂停语音 + 启动配置页 ====");
+                ESP_LOGW(kTag, "==== 进入配网模式：暂停语音 ====");
                 if (music_is_playing()) {
                     music_stop();
                     wake.set_music_window(false);
                 }
-                wake.pause();                  // 唤醒任务完全暂停（不录音不检测）
-                web_portal_http_start();
-            } else if (cfg_active &&
-                       (!want || web_portal_config_done_take() ||
-                        esp_timer_get_time() - cfg_start_us > kCfgTimeoutUs)) {
+                wake.pause();
+            } else if (!prov && cfg_active) {
                 cfg_active = false;
-                wait_disconnect = true;        // 手机还连着的话不要立刻又进来
-                web_portal_http_stop();
                 wake.resume();
-                wake.sleep_now();              // 回到"需要重新唤醒"状态
-                ESP_LOGW(kTag, "==== 退出配置模式：恢复语音，需要重新喊唤醒词 ====");
+                wake.sleep_now();          // 回到"需要重新唤醒"状态
+                ESP_LOGW(kTag, "==== 退出配网模式：恢复语音，需要重新喊唤醒词 ====");
             }
+
         }
 
         // ---- 每 60 秒做一次网络检查（配置模式下跳过，避免误重启）----

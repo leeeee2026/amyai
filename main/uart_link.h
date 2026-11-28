@@ -24,6 +24,10 @@ bool uart_link_init();
 // 返回 true = 主控确认收到。
 bool uart_link_send_command(const std::string& json);
 
+// 把一条 JSON 发给主控，但**不等 ACK**（发出去就返回）。
+// 用于配置下发：主控可能没接，界面不应该因为这个卡住。
+void uart_link_send_notify(const std::string& json);
+
 // 发急停帧（0x04），不等 ACK，立即返回。
 void uart_link_send_estop();
 

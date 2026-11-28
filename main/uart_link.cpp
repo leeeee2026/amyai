@@ -297,6 +297,31 @@ bool uart_link_send_command(const std::string& json)
     return ok;
 }
 
+// 配置下发用：组帧发一次就走，不等 ACK。
+// 现场没有主控时也不会阻塞 HTTP 请求（否则每次保存要卡 3 秒）。
+void uart_link_send_notify(const std::string& json)
+{
+    if (s_lock == nullptr) {
+        return;
+    }
+    uint8_t frame[512];
+    if (xSemaphoreTake(s_lock, pdMS_TO_TICKS(500)) != pdTRUE) {
+        // 串口正被"等 ACK"的指令占着，这次配置下发只能丢掉（配置已存 NVS，不影响功能）
+        ESP_LOGW(kTag, "下发配置时串口忙，本次跳过（配置已存 NVS）");
+        return;
+    }
+    const uint8_t seq = s_seq++;
+    const int n = build_frame(frame, sizeof(frame), kTypeCmd, seq,
+                              reinterpret_cast<const uint8_t*>(json.data()), json.size());
+    if (n > 0) {
+        uart_write_bytes(kPort, frame, n);
+        ESP_LOGI(kTag, "下发配置 seq=%u (%d 字节，不等 ACK): %s", seq, n, json.c_str());
+    } else {
+        ESP_LOGE(kTag, "组帧失败（payload 太长？）");
+    }
+    xSemaphoreGive(s_lock);
+}
+
 void uart_link_send_estop()
 {
     if (s_lock == nullptr) {
@@ -328,6 +353,7 @@ bool uart_link_is_estop_text(const std::string& text)
 
 bool uart_link_init() { return false; }
 bool uart_link_send_command(const std::string&) { return false; }
+void uart_link_send_notify(const std::string&) {}
 void uart_link_send_estop() {}
 bool uart_link_is_estop_text(const std::string&) { return false; }
 

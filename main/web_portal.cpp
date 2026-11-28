@@ -23,6 +23,8 @@
 #include "esp_heap_caps.h"
 #include "esp_timer.h"
 #include "esp_wifi.h"
+#include "esp_system.h"
+#include "uart_link.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "web_page.h"
@@ -35,7 +37,7 @@ constexpr const char* kTag = "portal";
 // ---- AP 参数（二维码里印的就是这一组）----
 constexpr const char* kApSsid = "AMYAI-CHAIR";
 constexpr const char* kApPass = "Amyai2k8m4x7p";   // 13 位强密码（无易混字符）
-constexpr bool        kApHidden = true;            // 隐藏 SSID，邻居搜不到
+constexpr bool        kApHidden = false;           // 广播 SSID：手机能直接搜到，扫码也能加
 constexpr uint8_t     kApChannel = 1;
 constexpr uint8_t     kApMaxConn = 2;
 
@@ -58,6 +60,10 @@ volatile bool s_need_connect = false;
 // STA 连接结果（页面轮询用）
 volatile bool s_sta_connected = false;
 volatile bool s_sta_failed = false;
+// 本次配网是否提交过 Wi-Fi：连上后据此自动退出配置模式
+volatile bool s_wifi_saved = false;
+// 页面请求进入"配网模式"：只有这个为 true 时才暂停语音
+volatile bool s_prov_req = false;
 
 // ---------------------------------------------------------------- STA 连接
 esp_netif_t* sta_netif()
@@ -244,12 +250,23 @@ esp_err_t handle_save_get(httpd_req_t* req)
 // 配网进度查询：页面提交 Wi-Fi 后轮询这个，连上了就自动跳到身体信息页
 esp_err_t handle_state(httpd_req_t* req)
 {
+    // ★ s_sta_connected 只在"网页里提交 Wi-Fi 后主动连接"的流程里更新；
+    //   设备开机自己连上的情况它是 false，所以这里必须查驱动的真实状态，
+    //   否则页面一直显示"未连接网络"。
+    wifi_ap_record_t ap{};
+    const bool really_connected = (esp_wifi_sta_get_ap_info(&ap) == ESP_OK);
+
     ESP_LOGI(kTag, "→ GET /state (provisioned=%d connected=%d failed=%d)",
-             has_wifi_credentials() ? 1 : 0, s_sta_connected ? 1 : 0, s_sta_failed ? 1 : 0);
+             has_wifi_credentials() ? 1 : 0, really_connected ? 1 : 0, s_sta_failed ? 1 : 0);
     cJSON* o = cJSON_CreateObject();
     cJSON_AddBoolToObject(o, "provisioned", has_wifi_credentials());
-    cJSON_AddBoolToObject(o, "connected", s_sta_connected);
+    cJSON_AddBoolToObject(o, "connected", really_connected);
     cJSON_AddBoolToObject(o, "failed", s_sta_failed);
+    cJSON_AddBoolToObject(o, "prov", s_prov_req);
+    if (really_connected) {
+        cJSON_AddStringToObject(o, "ssid", reinterpret_cast<const char*>(ap.ssid));
+        cJSON_AddNumberToObject(o, "rssi", ap.rssi);
+    }
     char* out = cJSON_PrintUnformatted(o);
     cJSON_Delete(o);
     httpd_resp_set_type(req, "application/json");
@@ -259,6 +276,89 @@ esp_err_t handle_state(httpd_req_t* req)
         cJSON_free(out);
     }
     return ESP_OK;
+}
+
+// ---------------------------------------------------------------- 偏好设置 JSON
+namespace {
+int jget(cJSON* o, const char* k, int def)
+{
+    cJSON* v = cJSON_GetObjectItem(o, k);
+    return cJSON_IsNumber(v) ? v->valueint : def;
+}
+int jclamp(int v, int lo, int hi, int def)
+{
+    return (v >= lo && v <= hi) ? v : def;
+}
+// 枚举型参数：不在允许集合里就回退默认值，避免主控收到无意义参数
+int jpick(int v, const int* allowed, int n, int def)
+{
+    for (int i = 0; i < n; ++i) {
+        if (v == allowed[i]) {
+            return v;
+        }
+    }
+    return def;
+}
+}  // namespace
+
+cJSON* prefs_to_json(const UserPrefs& p)
+{
+    cJSON* o = cJSON_CreateObject();
+    cJSON_AddNumberToObject(o, "program",      p.program);
+    cJSON_AddNumberToObject(o, "strength",     p.strength);
+    cJSON_AddNumberToObject(o, "speed",        p.speed);
+    cJSON_AddNumberToObject(o, "duration",     p.duration_min);
+    cJSON_AddNumberToObject(o, "parts",        p.parts_mask);
+    cJSON_AddNumberToObject(o, "air_neck",     p.air_neck);
+    cJSON_AddNumberToObject(o, "air_shoulder", p.air_shoulder);
+    cJSON_AddNumberToObject(o, "air_arm",      p.air_arm);
+    cJSON_AddNumberToObject(o, "air_leg",      p.air_leg);
+    cJSON_AddNumberToObject(o, "air_foot",     p.air_foot);
+    cJSON_AddNumberToObject(o, "foot_roller",  p.foot_roller);
+    cJSON_AddNumberToObject(o, "heat",         p.heat_mask);
+    cJSON_AddNumberToObject(o, "heat_temp",    p.heat_temp);
+    cJSON_AddNumberToObject(o, "volume",       p.volume);
+    cJSON_AddNumberToObject(o, "tts_speed",    p.tts_speed);
+    cJSON_AddNumberToObject(o, "tts_voice",    p.tts_voice);
+    cJSON_AddNumberToObject(o, "follow_up",    p.follow_up_sec);
+    cJSON_AddNumberToObject(o, "ack",          p.ack_enabled);
+    cJSON_AddNumberToObject(o, "child_lock",   p.child_lock);
+    cJSON_AddNumberToObject(o, "sedentary",    p.sedentary_min);
+    return o;
+}
+
+void json_to_prefs(cJSON* o, UserPrefs* p)
+{
+    if (o == nullptr || p == nullptr) {
+        return;
+    }
+    UserPrefs d = *p;
+    const int kDur[]   = {10, 20, 30, 45};
+    const int kTemp[]  = {40, 45, 50};
+    const int kFollow[] = {0, 15, 60, 600};
+    const int kSed[]   = {0, 30, 60, 120};
+
+    d.program       = static_cast<uint8_t>(jclamp(jget(o, "program",      d.program),       0,   5, d.program));
+    d.strength      = static_cast<uint8_t>(jclamp(jget(o, "strength",     d.strength),      1,   5, d.strength));
+    d.speed         = static_cast<uint8_t>(jclamp(jget(o, "speed",        d.speed),         0,   2, d.speed));
+    d.duration_min  = static_cast<uint8_t>(jpick(jget(o, "duration",      d.duration_min),  kDur, 4, d.duration_min));
+    d.parts_mask    = static_cast<uint8_t>(jclamp(jget(o, "parts",        d.parts_mask),    0, 127, d.parts_mask));
+    d.air_neck      = static_cast<uint8_t>(jclamp(jget(o, "air_neck",     d.air_neck),      0,   2, d.air_neck));
+    d.air_shoulder  = static_cast<uint8_t>(jclamp(jget(o, "air_shoulder", d.air_shoulder),  0,   2, d.air_shoulder));
+    d.air_arm       = static_cast<uint8_t>(jclamp(jget(o, "air_arm",      d.air_arm),       0,   2, d.air_arm));
+    d.air_leg       = static_cast<uint8_t>(jclamp(jget(o, "air_leg",      d.air_leg),       0,   2, d.air_leg));
+    d.air_foot      = static_cast<uint8_t>(jclamp(jget(o, "air_foot",     d.air_foot),      0,   2, d.air_foot));
+    d.foot_roller   = static_cast<uint8_t>(jclamp(jget(o, "foot_roller",  d.foot_roller),   0,   3, d.foot_roller));
+    d.heat_mask     = static_cast<uint8_t>(jclamp(jget(o, "heat",         d.heat_mask),     0,  31, d.heat_mask));
+    d.heat_temp     = static_cast<uint8_t>(jpick(jget(o, "heat_temp",     d.heat_temp),     kTemp, 3, d.heat_temp));
+    d.volume        = static_cast<uint8_t>(jclamp(jget(o, "volume",       d.volume),        0, 100, d.volume));
+    d.tts_speed     = static_cast<uint8_t>(jclamp(jget(o, "tts_speed",    d.tts_speed),     0,   2, d.tts_speed));
+    d.tts_voice     = static_cast<uint8_t>(jclamp(jget(o, "tts_voice",    d.tts_voice),     0,   2, d.tts_voice));
+    d.follow_up_sec = static_cast<uint16_t>(jpick(jget(o, "follow_up",    d.follow_up_sec), kFollow, 4, d.follow_up_sec));
+    d.ack_enabled   = static_cast<uint8_t>(jclamp(jget(o, "ack",          d.ack_enabled),   0,   1, d.ack_enabled));
+    d.child_lock    = static_cast<uint8_t>(jclamp(jget(o, "child_lock",   d.child_lock),    0,   1, d.child_lock));
+    d.sedentary_min = static_cast<uint8_t>(jpick(jget(o, "sedentary",     d.sedentary_min), kSed, 4, d.sedentary_min));
+    *p = d;
 }
 
 // 返回已保存的用户信息 + 当前 Wi-Fi，页面加载时回填用
@@ -277,6 +377,11 @@ esp_err_t handle_user(httpd_req_t* req)
     cJSON_AddNumberToObject(o, "age",    prof.age);
     cJSON_AddNumberToObject(o, "gender", prof.gender);
     cJSON_AddStringToObject(o, "ssid", ssid);
+
+    UserPrefs prefs{};
+    user_prefs_load(&prefs);
+    cJSON_AddItemToObject(o, "prefs", prefs_to_json(prefs));
+
     char* out = cJSON_PrintUnformatted(o);
     cJSON_Delete(o);
     httpd_resp_set_type(req, "application/json");
@@ -369,6 +474,22 @@ esp_err_t handle_save(httpd_req_t* req)
         const int gv = g->valueint;
         prof.gender = (gv == 1 || gv == 2) ? static_cast<uint8_t>(gv) : 0;
     }
+
+    // 偏好设置（可选）：解析 + 记录原始 JSON 用于下发主控
+    UserPrefs prefs{};
+    user_prefs_load(&prefs);
+    bool has_prefs = false;
+    std::string prefs_uart;
+    cJSON* j_prefs = cJSON_GetObjectItem(root, "prefs");
+    if (cJSON_IsObject(j_prefs)) {
+        json_to_prefs(j_prefs, &prefs);
+        has_prefs = true;
+        char* s = cJSON_PrintUnformatted(j_prefs);
+        if (s != nullptr) {
+            prefs_uart = std::string(R"({"cmd":"set_cfg","prefs":)") + s + "}";
+            cJSON_free(s);
+        }
+    }
     cJSON_Delete(root);
 
     ESP_LOGI(kTag, "收到配置：Wi-Fi=\"%s\" 身高=%u 体重=%u 年龄=%u 性别=%u",
@@ -384,9 +505,16 @@ esp_err_t handle_save(httpd_req_t* req)
             return ESP_OK;
         }
         user_profile_save(prof);      // 顺手保存（页面没填就是保持原值）
+        if (has_prefs) {
+            user_prefs_save(prefs);
+            if (!prefs_uart.empty()) {
+                uart_link_send_notify(prefs_uart);
+            }
+        }
         // ★ 不重启：马上发起 STA 连接，连上后页面会自动跳到身体信息页
         s_sta_connected = false;
         s_sta_failed    = false;
+        s_wifi_saved    = true;      // 记下"这次配网提交过 Wi-Fi"，连上后好自动退出
         s_need_connect  = true;
         ESP_LOGW(kTag, "Wi-Fi 配置已保存，开始连接（不重启，连上后跳到身体信息页）");
         httpd_resp_set_type(req, "application/json");
@@ -401,14 +529,66 @@ esp_err_t handle_save(httpd_req_t* req)
     }
     s_profile_saved = true;
     ESP_LOGI(kTag, "身体信息已保存");
+
+    // 偏好设置：存 NVS + 下发主控（不等 ACK，主控没接也不阻塞页面）
+    if (has_prefs) {
+        if (!user_prefs_save(prefs)) {
+            // NVS 写失败要如实告诉页面，否则用户以为存上了
+            ESP_LOGE(kTag, "偏好保存失败");
+            httpd_resp_sendstr(req, R"({"ok":false,"error":"设置保存失败，请重试"})");
+            return ESP_OK;
+        }
+        ESP_LOGI(kTag, "偏好已保存，开始下发主控");
+        if (!prefs_uart.empty()) {
+            uart_link_send_notify(prefs_uart);
+        }
+    }
+
     httpd_resp_set_type(req, "application/json");
     httpd_resp_sendstr(req, R"({"ok":true})");
     return ESP_OK;
 }
 
-// Captive portal 探测接口：让手机连上后自动弹出配置页
-esp_err_t handle_captive(httpd_req_t* req)
+// 页面请求进入/退出"配网模式"
+//   {"on":true}  -> 暂停语音，Wi-Fi 卡显示表单
+//   {"on":false} -> 恢复语音，Wi-Fi 卡显示当前网络
+esp_err_t handle_prov(httpd_req_t* req)
 {
+    char body[128];
+    bool on = false;
+    if (read_body(req, body, sizeof(body)) > 0) {
+        cJSON* r = cJSON_Parse(body);
+        if (r != nullptr) {
+            cJSON* j = cJSON_GetObjectItem(r, "on");
+            if (cJSON_IsBool(j)) {
+                on = cJSON_IsTrue(j);
+            } else if (cJSON_IsNumber(j)) {
+                on = (j->valueint != 0);
+            }
+            cJSON_Delete(r);
+        }
+    }
+    s_prov_req = on;
+    ESP_LOGW(kTag, "→ POST /prov 配网模式=%s", on ? "开" : "关");
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_sendstr(req, on ? R"({"ok":true,"prov":true})" : R"({"ok":true,"prov":false})");
+    return ESP_OK;
+}
+
+// 恢复出厂：清空 NVS 用户数据后重启
+esp_err_t handle_reset(httpd_req_t* req){
+    ESP_LOGW(kTag, "→ GET /reset 恢复出厂设置");
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_sendstr(req, R"({"ok":true,"msg":"正在恢复出厂并重启"})");
+    vTaskDelay(pdMS_TO_TICKS(400));   // 让响应先发出去
+    user_data_erase();
+    vTaskDelay(pdMS_TO_TICKS(300));
+    esp_restart();
+    return ESP_OK;
+}
+
+// Captive portal 探测接口：让手机连上后自动弹出配置页
+esp_err_t handle_captive(httpd_req_t* req){
     httpd_resp_set_status(req, "302 Found");
     httpd_resp_set_hdr(req, "Location", "http://192.168.4.1/");
     httpd_resp_send(req, nullptr, 0);
@@ -450,10 +630,11 @@ bool start_ap_impl(int channel)
 
     s_ap_running = true;
     ESP_LOGW(kTag, "======== 网页配网已启动 ========");
-    ESP_LOGW(kTag, "Wi-Fi 名称: %s（隐藏网络）", kApSsid);
+    ESP_LOGW(kTag, "Wi-Fi 名称: %s（%s）", kApSsid, kApHidden ? "隐藏网络" : "已广播");
     ESP_LOGW(kTag, "Wi-Fi 密码: %s", kApPass);
     ESP_LOGW(kTag, "配置页地址: http://192.168.4.1/");
-    ESP_LOGW(kTag, "二维码内容: WIFI:T:WPA;S:%s;P:%s;H:true;;", kApSsid, kApPass);
+    ESP_LOGW(kTag, "二维码内容: WIFI:T:WPA;S:%s;P:%s;H:%s;;", kApSsid, kApPass,
+             kApHidden ? "true" : "false");
 
     // AP 下的手机由 ESP32 的 DHCP 服务自动分配 192.168.4.x
     esp_netif_ip_info_t ip{};
@@ -466,7 +647,7 @@ bool start_ap_impl(int channel)
 bool start_http_impl()
 {
     httpd_config_t cfg = HTTPD_DEFAULT_CONFIG();
-    cfg.max_uri_handlers = 16;   // 5 个业务接口 + 6 个 captive portal 探测
+    cfg.max_uri_handlers = 20;   // 8 个业务接口 + 6 个 captive 探测，留余量
     cfg.lru_purge_enable = true;
     cfg.server_port      = 80;
     cfg.stack_size       = 6144;   // 处理 JSON 用，稍微给足一点
@@ -510,6 +691,18 @@ bool start_http_impl()
     u_user.handler = handle_user;
     httpd_register_uri_handler(s_server, &u_user);
 
+    httpd_uri_t u_reset = {};
+    u_reset.uri = "/reset";
+    u_reset.method = HTTP_POST;   // 状态变更用 POST，避免被 <img src> 之类的 GET 误触发
+    u_reset.handler = handle_reset;
+    httpd_register_uri_handler(s_server, &u_reset);
+
+    httpd_uri_t u_prov = {};
+    u_prov.uri = "/prov";
+    u_prov.method = HTTP_POST;
+    u_prov.handler = handle_prov;
+    httpd_register_uri_handler(s_server, &u_prov);
+
     httpd_uri_t u_save = {};
     u_save.uri = "/save";
     u_save.method = HTTP_POST;
@@ -551,7 +744,7 @@ bool web_portal_ap_start(int channel)
     if (s_ap_running) {
         return true;
     }
-    ESP_LOGW(kTag, "启动常驻 AP（隐藏网络，仅用于扫码进入配置页）");
+    ESP_LOGW(kTag, "启动常驻 AP（用于手机扫码/连接进入配置页）");
     return start_ap_impl(channel);
 }
 
@@ -576,6 +769,28 @@ bool web_portal_config_done_take()
         return true;
     }
     return false;
+}
+
+// 本次配网提交过 Wi-Fi 且现在已连上 → 返回 true（取走标志，只触发一次）
+bool web_portal_wifi_done_take()
+{
+    if (s_wifi_saved && s_sta_connected) {
+        s_wifi_saved = false;
+        return true;
+    }
+    return false;
+}
+
+// 页面是否请求进入"配网模式"（此时暂停语音）
+bool web_portal_prov_wanted()
+{
+    return s_prov_req;
+}
+
+// 强制退出配网模式（超时兜底用）
+void web_portal_prov_clear()
+{
+    s_prov_req = false;
 }
 
 void web_portal_run()
@@ -641,6 +856,8 @@ void web_portal_run()
             }
             s_sta_connected = ok;
             if (ok) {
+                s_wifi_saved = false;    // 已经连上，不用再等
+                s_prov_req   = false;    // 配网完成：页面切回"当前网络"，语音恢复
                 esp_netif_ip_info_t ip{};
                 if (esp_netif_get_ip_info(sta_netif(), &ip) == ESP_OK) {
                     ESP_LOGW(kTag, "Wi-Fi 连接成功！IP: " IPSTR "（页面切到身体信息页）", IP2STR(&ip.ip));
